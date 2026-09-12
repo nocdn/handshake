@@ -21,6 +21,18 @@ internal sealed class ToastPresenter : IAlertPresenter, IDisposable
     private readonly Dictionary<AlertStyle, ToastChannel> _channels = [];
     private bool _disposed;
 
+    /// <summary>
+    /// How many content toasts have taken the standard channel. Lifecycle
+    /// receipts such as "Config reloaded" capture this when a reload starts
+    /// and yield when it moved: a newer user toast already showing must not
+    /// be clobbered by older news. Hides (zero duration) and following pills
+    /// use an independent channel, so neither moves this counter.
+    /// Incremented on the dispatcher; safe to read from any thread.
+    /// </summary>
+    public long StandardContentShows => Volatile.Read(ref _standardContentShows);
+
+    private long _standardContentShows;
+
     public ToastPresenter()
         : this(WpfApplication.Current.Dispatcher, NullRuntimeLogger.Instance)
     {
@@ -147,6 +159,11 @@ internal sealed class ToastPresenter : IAlertPresenter, IDisposable
             HideChannel(channel);
             _logger.Info($"Toast hide timing text='{FormatTextForLog(request.Text)}' totalMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
             return;
+        }
+
+        if (request.Style is AlertStyle.Standard)
+        {
+            Interlocked.Increment(ref _standardContentShows);
         }
 
         var window = GetOrCreateWindow(channel);

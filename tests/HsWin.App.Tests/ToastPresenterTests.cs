@@ -265,6 +265,61 @@ public sealed class ToastPresenterTests
         });
     }
 
+    [Fact]
+    public void StandardContentShowsStartsAtZero()
+    {
+        using var presenter = new ToastPresenter(
+            Dispatcher.CurrentDispatcher,
+            () => new FakeToastView(),
+            _ => { });
+
+        Assert.Equal(0, presenter.StandardContentShows);
+    }
+
+    [Fact]
+    public void StandardContentShowsCountsContentToasts()
+    {
+        using var presenter = new ToastPresenter(
+            Dispatcher.CurrentDispatcher,
+            () => new FakeToastView(),
+            _ => { });
+
+        presenter.Show(AlertRequest.Create("First", AlertKind.Normal, 1000));
+        Assert.Equal(1, presenter.StandardContentShows);
+
+        presenter.Show(AlertRequest.Create("Second", AlertKind.Success, 1000));
+        Assert.Equal(2, presenter.StandardContentShows);
+    }
+
+    [Fact]
+    public void StandardContentShowsIgnoresHides()
+    {
+        using var presenter = new ToastPresenter(
+            Dispatcher.CurrentDispatcher,
+            () => new FakeToastView(),
+            _ => { });
+
+        presenter.Show(AlertRequest.Create("Visible", AlertKind.Normal, 1000));
+        presenter.Show(AlertRequest.Create("Hide", AlertKind.Normal, 0));
+
+        Assert.Equal(1, presenter.StandardContentShows);
+    }
+
+    [Fact]
+    public void StandardContentShowsIgnoresFollowingStyle()
+    {
+        var follower = new FakeCursorFollowingToastController();
+        using var presenter = new ToastPresenter(
+            Dispatcher.CurrentDispatcher,
+            _ => new FakeToastView(),
+            _ => { },
+            follower);
+
+        presenter.Show(AlertRequest.Create("Follow", durationMs: 6000, style: AlertStyle.Following));
+
+        Assert.Equal(0, presenter.StandardContentShows);
+    }
+
     private sealed class FakeToastView : IToastView
     {
         public List<AlertRequest> Requests { get; } = [];

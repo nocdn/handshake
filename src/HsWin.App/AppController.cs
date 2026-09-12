@@ -422,6 +422,7 @@ internal sealed class AppController : IDisposable
         var startedAt = Stopwatch.GetTimestamp();
         _logger.Info($"Reload Config requested generation={generation}.");
         _toastPresenter.Show(ConfigReloadAlerts.CreateReloadingAlert());
+        var toastBaseline = CaptureStandardToastBaseline();
 
         Task.Run(() =>
         {
@@ -463,11 +464,30 @@ internal sealed class AppController : IDisposable
                 Thread.Sleep(remainingReloadingTime);
             }
 
-            _dispatcher.BeginInvoke(() => CompleteReloadOnDispatcher(generation, failure, startedAt));
+            _dispatcher.BeginInvoke(() => CompleteReloadOnDispatcher(generation, failure, startedAt, toastBaseline));
         });
     }
 
-    private void CompleteReloadOnDispatcher(int generation, Exception? failure, long startedAt)
+    /// <summary>
+    /// Counts the reload loader itself, so only toasts shown after it move
+    /// the baseline. Barriers through the dispatcher off-thread at Send
+    /// priority — the loader <see cref="ToastPresenter.Show"/> is queued just
+    /// before at the same priority, so it is always counted first. Exact
+    /// when already on the dispatcher.
+    /// </summary>
+    private long CaptureStandardToastBaseline()
+    {
+        if (_dispatcher.CheckAccess())
+        {
+            return _toastPresenter.StandardContentShows;
+        }
+
+        return _dispatcher.Invoke(
+            () => _toastPresenter.StandardContentShows,
+            DispatcherPriority.Send);
+    }
+
+    private void CompleteReloadOnDispatcher(int generation, Exception? failure, long startedAt, long toastBaseline)
     {
         if (_disposed || generation != Volatile.Read(ref _reloadGeneration))
         {
@@ -478,6 +498,13 @@ internal sealed class AppController : IDisposable
         {
             _logger.Error("Config reload failed.", failure);
             _toastPresenter.Show(ConfigReloadAlerts.CreateReloadFailedAlert(failure));
+            return;
+        }
+
+        if (_toastPresenter.StandardContentShows != toastBaseline)
+        {
+            _logger.Info(
+                $"Config reloaded toast skipped generation={generation}: a newer toast is already showing.");
             return;
         }
 
