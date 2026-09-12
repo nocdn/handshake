@@ -13,6 +13,26 @@ public sealed record AlertRequest(string Text, AlertKind Kind, int DurationMs)
 
     public AlertStyle Style { get; init; } = DefaultStyle;
 
+    /// <summary>
+    /// When true, a text change on the visible toast rolls glyph-by-glyph in
+    /// the style of Scritto (SwiftUI's numeric text transition on the web)
+    /// instead of snapping: surviving glyphs slide to their new places while
+    /// the rest roll out and their replacements roll in.
+    /// </summary>
+    public bool AnimateRoll { get; init; }
+
+    /// <summary>
+    /// Roll direction: 1 arrives from below, -1 from above, 0 reads it off
+    /// the numbers in the value. Mirrors Scritto's <c>trend</c>.
+    /// </summary>
+    public int Trend { get; init; }
+
+    /// <summary>Per-glyph roll duration in milliseconds (Scritto default 550).</summary>
+    public int RollDurationMs { get; init; } = ScrittoTiming.DefaultDurationMs;
+
+    /// <summary>When true, swaps the roll spring for the bouncier preset.</summary>
+    public bool Bounce { get; init; }
+
     public AlertIcon EffectiveIcon =>
         Style is AlertStyle.Following
             ? AlertIcon.None
@@ -25,11 +45,26 @@ public sealed record AlertRequest(string Text, AlertKind Kind, int DurationMs)
         AlertKind? kind = null,
         int? durationMs = null,
         AlertIcon? icon = null,
-        AlertStyle? style = null)
+        AlertStyle? style = null,
+        bool animateRoll = false,
+        int trend = 0,
+        int? rollDurationMs = null,
+        bool bounce = false)
     {
         if (string.IsNullOrWhiteSpace(text))
         {
             throw new ArgumentException("Alert text cannot be empty.", nameof(text));
+        }
+
+        if (trend is not -1 and not 0 and not 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(trend), "Alert trend must be -1, 0, or 1.");
+        }
+
+        var normalizedRollDurationMs = rollDurationMs ?? ScrittoTiming.DefaultDurationMs;
+        if (normalizedRollDurationMs < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(rollDurationMs), "Alert roll duration cannot be negative.");
         }
 
         var normalizedDurationMs = durationMs ?? DefaultDurationMs;
@@ -41,7 +76,11 @@ public sealed record AlertRequest(string Text, AlertKind Kind, int DurationMs)
         return new AlertRequest(text, kind ?? DefaultKind, normalizedDurationMs)
         {
             Icon = icon ?? DefaultIcon,
-            Style = style ?? DefaultStyle
+            Style = style ?? DefaultStyle,
+            AnimateRoll = animateRoll,
+            Trend = trend,
+            RollDurationMs = normalizedRollDurationMs,
+            Bounce = bounce
         };
     }
 

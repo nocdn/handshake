@@ -1,6 +1,7 @@
 using HsWin.Core.Alerts;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
@@ -64,6 +65,8 @@ internal sealed class ToastWindow : Window, IToastView
     private readonly Viewbox _loader;
     private readonly RotateTransform _loaderRotation;
     private readonly TextBlock _text;
+    private readonly ScrittoTextPanel _scritto;
+    private bool _scrittoLive;
     private bool _loaderSpinning;
 
     public ToastWindow()
@@ -85,6 +88,16 @@ internal sealed class ToastWindow : Window, IToastView
         _loader = CreateLoaderIcon(_loaderRotation);
         _iconSlot = CreateIconSlot(_dot, _loader);
         _text = CreateText();
+        _scritto = new ScrittoTextPanel
+        {
+            VerticalAlignment = VerticalAlignment.Center,
+            Visibility = Visibility.Collapsed,
+        };
+        TextElement.SetFontFamily(_scritto, ToastFonts.RegularFontFamily);
+        TextElement.SetFontSize(_scritto, ToastStyleMetrics.TextFontSize);
+        TextElement.SetFontWeight(_scritto, ToastStyleMetrics.TextFontWeight);
+        _scritto.SetValue(TextElement.ForegroundProperty, TextBrush);
+        _scritto.WidthRollStarted += OnScrittoWidthRollStarted;
 
         var panel = new StackPanel
         {
@@ -93,6 +106,7 @@ internal sealed class ToastWindow : Window, IToastView
         };
         panel.Children.Add(_iconSlot);
         panel.Children.Add(_text);
+        panel.Children.Add(_scritto);
 
         _border = new PillBorder
         {
@@ -127,7 +141,71 @@ internal sealed class ToastWindow : Window, IToastView
 
     public void UpdateRequest(AlertRequest request)
     {
+        ApplyIconState(request);
+
+        if (request.AnimateRoll)
+        {
+            _text.Visibility = Visibility.Collapsed;
+            _scritto.Visibility = Visibility.Visible;
+            if (!_scrittoLive)
+            {
+                _scritto.Snap(request.Text);
+                _scrittoLive = true;
+            }
+            else
+            {
+                RollOrSnap(request);
+            }
+
+            return;
+        }
+
+        _scritto.Visibility = Visibility.Collapsed;
+        _text.Visibility = Visibility.Visible;
         _text.Text = request.Text;
+        _scrittoLive = false;
+    }
+
+    /// <summary>
+    /// Rolls the panel, falling back to an instant set if the roll cannot
+    /// run: eye candy must never take down the toast path on the dispatcher.
+    /// </summary>
+    private void RollOrSnap(AlertRequest request)
+    {
+        try
+        {
+            _scritto.Roll(request.Text, request.Trend, request.RollDurationMs, request.Bounce);
+        }
+        catch (Exception)
+        {
+            _scritto.Snap(request.Text);
+        }
+    }
+
+    /// <summary>
+    /// Rides the window's left edge while the roll animates the pill width,
+    /// so a centered toast stays centered instead of growing rightward.
+    /// </summary>
+    private void OnScrittoWidthRollStarted(double oldWidth, double newWidth, TimeSpan duration)
+    {
+        var from = Left;
+        if (double.IsNaN(from))
+        {
+            return;
+        }
+
+        var to = from - (newWidth - oldWidth) / 2;
+        var animation = new DoubleAnimation(from, to, duration)
+        {
+            EasingFunction = new ScrittoShrinkEasing(),
+            FillBehavior = FillBehavior.Stop,
+        };
+        BeginAnimation(LeftProperty, animation);
+        Left = to;
+    }
+
+    private void ApplyIconState(AlertRequest request)
+    {
         var icon = request.EffectiveIcon;
 
         if (icon is AlertIcon.None)

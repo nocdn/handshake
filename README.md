@@ -2,7 +2,7 @@
 
 Hammerspoon (Windows Edition) is a tray-first Windows automation host inspired by Hammerspoon. It starts without a main window, loads JavaScript from `%APPDATA%\HsWin\config.js`, and exposes a frozen `hs` global plus `console` logging.
 
-Reload the config from the tray menu at any time. Reload work runs off the UI thread so the tray stays responsive. A `Reloading config…` toast with a spinning loader appears immediately; when reload finishes, it is replaced by a `Config reloaded` success toast (or an error toast if reload failed). Each reload starts a fresh JavaScript engine, disposes previous hotkey bindings, keyboard watchers, clipboard watchers, and timers, and rotates the config console log file.
+Reload the config from the tray menu at any time. Reload work runs off the UI thread so the tray stays responsive. A `Reloading config…` toast with a spinning loader appears immediately; when reload finishes, it is replaced by a `Config reloaded` success toast (or an error toast if reload failed). A newer toast shown from the fresh config meanwhile keeps the channel: the success receipt yields instead of clobbering it, so script-driven feedback (for example a rolling number) is never buried under older news. Error toasts always show. Each reload starts a fresh JavaScript engine, disposes previous hotkey bindings, keyboard watchers, clipboard watchers, and timers, and rotates the config console log file.
 
 Startup is single-instance. Before the tray app creates hotkeys, keyboard hooks, timers, or the JavaScript runtime, the new process stops any older `Hammerspoon (Windows Edition)` or `HsWin.App` processes in the current Windows session and takes a named instance guard. This prevents stale instances from keeping global hotkeys registered after an upgrade or test launch.
 
@@ -73,6 +73,19 @@ Object options also accept `icon`/`indicator` and `loading`/`loader`/`spinner`. 
 Set `style: "following"` (or the `variant` alias) for a click-through, text-only pill that smoothly follows the cursor. Following aliases are `follow`, `cursor`, and `cursor-following`; use `standard`, `default`, or `normal` to select the normal toast. A following toast displays only `text`—icons and status dots are intentionally suppressed—but still honors `durationMs`. Its 12 pt **Inter Medium** type, 8×4 padding, capsule colors, down-right cursor offset, screen-edge clamping, and 120 ms ease-out / 160 ms ease-in fade are based on Snap's native cursor status pill. Cursor movement uses a slightly quicker 60 ms exponential response on an independent native 240 Hz loop, while standard and following toasts use independent lifecycles, so a standard toast cannot throttle, replace, or dismiss the following pill.
 
 The app prewarms the standard toast window at startup and keeps toast windows alive offscreen between alerts, so repeated hotkey feedback avoids recreating or remapping WPF windows. Standard toast text uses embedded **Inter Regular**, while following pills use embedded **Inter Medium**. Inter is distributed under the SIL Open Font License 1.1; see `src/HsWin.App/Assets/Fonts/LICENSE.txt`.
+
+### `hs.alert.show` with Scritto rolling text
+
+Pass `scritto: true` (aliases `roll`, `animate`, `animated`) and later text changes on the same toast roll glyph-by-glyph instead of snapping, in the style of [Scritto](https://github.com/JaceThings/Scritto) (SwiftUI's numeric text transition): surviving glyphs slide to their new places while the rest roll out and their replacements roll in. Any string rolls, not just digits, and graphemes (emoji, combining marks) are never torn apart.
+
+```js
+hs.alert.show("50", { type: "normal", durationMs: 1500, scritto: true });
+hs.alert.show("51", { type: "normal", durationMs: 1500, scritto: true }); // rolls 0 -> 1
+```
+
+Options are `trend` (`1`/`"up"` arrives from below, `-1`/`"down"` from above, `0`/`"auto"` reads it off the numbers, default `0`), `bounce` (bouncier spring preset, default `false`), and `rollDurationMs` (per-glyph roll duration, default `550`; aliases `rollDuration`, `animationDuration`, `transitionDuration`, plus nested `transition: { duration }`). Keep the roll shorter than the gap between updates: a value changing faster than its own roll stacks outgoing ghosts, same as the web library. `hs.alert.operation(...).update(text, options)` passes these through, so operation toasts can roll too.
+
+The first `scritto` show sets the text with no motion (rolling on first paint would animate from empty); equal text is a no-op. Rolling applies to standard toasts; following pills show instantly. With Windows animations turned off, or a zero roll duration, the text sets instantly.
 
 ### `hs.alert.operation(text, options?)`
 
