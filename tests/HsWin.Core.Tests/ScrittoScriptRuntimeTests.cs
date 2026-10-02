@@ -9,7 +9,10 @@ public sealed class ScrittoScriptRuntimeTests
     public void ReloadPassesScrittoRollOptionsThrough()
     {
         var presenter = new CapturingAlertPresenter();
-        using var runtime = new ScriptRuntime(presenter);
+        using var runtime = new ScriptRuntime(new ScriptRuntimeServices
+        {
+            Alerts = presenter
+        });
 
         runtime.Reload("""hs.alert.show("Count 50", { type: "normal", durationMs: 1500, scritto: true, trend: 1, rollDurationMs: 300, bounce: true });""");
 
@@ -25,7 +28,10 @@ public sealed class ScrittoScriptRuntimeTests
     public void ReloadAcceptsRollAliasAndNestedTransitionDuration()
     {
         var presenter = new CapturingAlertPresenter();
-        using var runtime = new ScriptRuntime(presenter);
+        using var runtime = new ScriptRuntime(new ScriptRuntimeServices
+        {
+            Alerts = presenter
+        });
 
         runtime.Reload("""hs.alert.show("Count 51", { roll: true, transition: { duration: 300 } });""");
 
@@ -38,7 +44,10 @@ public sealed class ScrittoScriptRuntimeTests
     public void ReloadRejectsUnknownTrend()
     {
         var presenter = new CapturingAlertPresenter();
-        using var runtime = new ScriptRuntime(presenter);
+        using var runtime = new ScriptRuntime(new ScriptRuntimeServices
+        {
+            Alerts = presenter
+        });
 
         var exception = Assert.ThrowsAny<Exception>(() =>
             runtime.Reload("""hs.alert.show("Count 52", { scritto: true, trend: 2 });"""));

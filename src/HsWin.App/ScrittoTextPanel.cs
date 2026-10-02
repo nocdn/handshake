@@ -294,6 +294,7 @@ internal sealed class ScrittoTextPanel : Grid
             AnimateDouble(block.Scale, ScaleTransform.ScaleXProperty, 1, ScrittoTiming.GlyphScale, delay, duration, spring, null);
             AnimateDouble(block.Scale, ScaleTransform.ScaleYProperty, 1, ScrittoTiming.GlyphScale, delay, duration, spring, null);
             AnimateDouble(block.Rotate, RotateTransform.AngleProperty, 0, ScrittoTiming.GlyphRotateDeg, delay, duration, spring, null);
+            block.EnableBlur();
             AnimateDouble(block.Blur, BlurEffect.RadiusProperty, 0, farBlur, delay, duration, spring, () =>
             {
                 if (generation == _generation && ReferenceEquals(block.Parent, _ghosts))
@@ -360,6 +361,7 @@ internal sealed class ScrittoTextPanel : Grid
             block.Scale.ScaleX = ScrittoTiming.GlyphScale;
             block.Scale.ScaleY = ScrittoTiming.GlyphScale;
             block.Rotate.Angle = ScrittoTiming.GlyphRotateDeg;
+            block.EnableBlur();
             block.Blur.Radius = nearBlur;
 
             AnimateDouble(block, OpacityProperty, 0, 1, delay, duration, spring, null);
@@ -367,7 +369,7 @@ internal sealed class ScrittoTextPanel : Grid
             AnimateDouble(block.Scale, ScaleTransform.ScaleXProperty, ScrittoTiming.GlyphScale, 1, delay, duration, spring, null);
             AnimateDouble(block.Scale, ScaleTransform.ScaleYProperty, ScrittoTiming.GlyphScale, 1, delay, duration, spring, null);
             AnimateDouble(block.Rotate, RotateTransform.AngleProperty, ScrittoTiming.GlyphRotateDeg, 0, delay, duration, spring, null);
-            AnimateDouble(block.Blur, BlurEffect.RadiusProperty, nearBlur, 0, delay, duration, spring, null);
+            AnimateDouble(block.Blur, BlurEffect.RadiusProperty, nearBlur, 0, delay, duration, spring, block.DisableBlur);
         }
     }
 
@@ -532,8 +534,13 @@ internal sealed class ScrittoTextPanel : Grid
             RenderTransform = group;
             RenderTransformOrigin = new WpfPoint(0.5, 0.5);
             VerticalAlignment = VerticalAlignment.Center;
-            Effect = Blur;
         }
+
+        // A pixel-shader effect forces an off-screen render pass, so glyphs carry it only
+        // while their blur is animating; resting text renders directly.
+        public void EnableBlur() => Effect = Blur;
+
+        public void DisableBlur() => Effect = null;
 
         public void ResetVisual()
         {
@@ -551,6 +558,7 @@ internal sealed class ScrittoTextPanel : Grid
             Scale.ScaleY = 1;
             Rotate.Angle = 0;
             Blur.Radius = 0;
+            DisableBlur();
         }
 
         public void RemoveFromParent()

@@ -1,32 +1,43 @@
-using System.Runtime.InteropServices;
 using System.IO;
+using HsWin.App.Lifecycle;
+using System.Runtime.InteropServices;
+using Microsoft.Win32;
 
 namespace HsWin.App;
 
-internal sealed class CliInstallService
+/// <summary>The user's persisted PATH value, read and written without expanding <c>%VARIABLES%</c>.</summary>
+internal interface IUserPathStore
+{
+    string? Read();
+
+    void Write(string value);
+}
+
+internal sealed class CliInstallService : ICliInstaller
 {
     public const string CliFileName = "hspn.exe";
 
-    private const uint WmSettingChange = 0x001A;
-    private const uint SmtoAbortIfHung = 0x0002;
-    private static readonly nint HwndBroadcast = 0xffff;
-
     private readonly string _installDirectory;
+    private readonly IUserPathStore _userPath;
 
     public CliInstallService(string installDirectory)
+        : this(installDirectory, RegistryUserPathStore.Instance)
+    {
+    }
+
+    internal CliInstallService(string installDirectory, IUserPathStore userPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(installDirectory);
 
         _installDirectory = Path.GetFullPath(installDirectory);
+        _userPath = userPath;
     }
 
     public string CliPath => Path.Combine(_installDirectory, CliFileName);
 
     public bool IsInstalled()
     {
-        return PathContainsDirectory(
-            Environment.GetEnvironmentVariable("Path", EnvironmentVariableTarget.User),
-            _installDirectory);
+        return PathContainsDirectory(_userPath.Read(), _installDirectory);
     }
 
     public CliInstallResult Install()
@@ -38,22 +49,19 @@ internal sealed class CliInstallService
                 CliPath);
         }
 
-        var userPath = Environment.GetEnvironmentVariable("Path", EnvironmentVariableTarget.User);
+        var userPath = _userPath.Read();
         if (PathContainsDirectory(userPath, _installDirectory))
         {
             return CliInstallResult.AlreadyInstalled;
         }
 
-        var updatedUserPath = AddDirectoryToPath(userPath, _installDirectory);
-        Environment.SetEnvironmentVariable("Path", updatedUserPath, EnvironmentVariableTarget.User);
+        _userPath.Write(AddDirectoryToPath(userPath, _installDirectory));
 
         var processPath = Environment.GetEnvironmentVariable("Path", EnvironmentVariableTarget.Process);
         Environment.SetEnvironmentVariable(
             "Path",
             AddDirectoryToPath(processPath, _installDirectory),
             EnvironmentVariableTarget.Process);
-
-        BroadcastEnvironmentChange();
         return CliInstallResult.Installed;
     }
 
@@ -73,6 +81,7 @@ internal sealed class CliInstallService
                 && string.Equals(normalizedEntry, normalizedDirectory, StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>Appends <paramref name="directory"/>, leaving every existing entry exactly as written.</summary>
     internal static string AddDirectoryToPath(string? pathValue, string directory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
@@ -100,39 +109,59 @@ internal sealed class CliInstallService
             normalizedDirectory = NormalizeDirectory(directory);
             return true;
         }
-        catch (ArgumentException)
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
         {
+            normalizedDirectory = string.Empty;
+            return false;
         }
-        catch (NotSupportedException)
-        {
-        }
-        catch (PathTooLongException)
-        {
-        }
-
-        normalizedDirectory = string.Empty;
-        return false;
     }
+}
 
-    private static void BroadcastEnvironmentChange()
+/// <summary>
+/// <c>HKCU\Environment\Path</c> accessed raw. <see cref="Environment.GetEnvironmentVariable(string, EnvironmentVariableTarget)"/>
+/// returns the value already expanded and writes it back as REG_SZ, which would permanently replace
+/// entries such as <c>%USERPROFILE%\bin</c> with today's expansion.
+/// </summary>
+internal sealed partial class RegistryUserPathStore : IUserPathStore
+{
+    private const string EnvironmentKeyPath = "Environment";
+    private const string PathValueName = "Path";
+    private const uint WmSettingChange = 0x001A;
+    private const uint SmtoAbortIfHung = 0x0002;
+    private const uint BroadcastTimeoutMs = 5000;
+    private static readonly nint HwndBroadcast = 0xffff;
+
+    public static RegistryUserPathStore Instance { get; } = new();
+
+    private RegistryUserPathStore()
     {
-        _ = SendMessageTimeout(
-            HwndBroadcast,
-            WmSettingChange,
-            0,
-            "Environment",
-            SmtoAbortIfHung,
-            5000,
-            out _);
     }
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern nint SendMessageTimeout(
-        nint hWnd,
-        uint msg,
+    public string? Read()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(EnvironmentKeyPath, writable: false);
+        return key?.GetValue(PathValueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+    }
+
+    public void Write(string value)
+    {
+        using (var key = Registry.CurrentUser.CreateSubKey(EnvironmentKeyPath, writable: true))
+        {
+            // REG_EXPAND_SZ, as Windows stores the user PATH, so %VARIABLES% keep expanding.
+            key.SetValue(PathValueName, value, RegistryValueKind.ExpandString);
+        }
+
+        // Tell Explorer and new shells to reload the environment.
+        _ = SendMessageTimeout(HwndBroadcast, WmSettingChange, 0, EnvironmentKeyPath, SmtoAbortIfHung, BroadcastTimeoutMs, out _);
+    }
+
+    [LibraryImport("user32.dll", EntryPoint = "SendMessageTimeoutW", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial nint SendMessageTimeout(
+        nint windowHandle,
+        uint message,
         nuint wParam,
         string lParam,
         uint flags,
-        uint timeout,
+        uint timeoutMs,
         out nuint result);
 }

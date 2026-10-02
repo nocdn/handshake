@@ -7,13 +7,16 @@ namespace HsWin.App;
 
 internal sealed class FileLogger : IRuntimeLogger, IDisposable
 {
+    private const int MaxQueuedEntries = 20_000;
+
     private readonly string _logFilePath;
-    private readonly BlockingCollection<LogEntry> _entries = [];
+    private readonly BlockingCollection<LogEntry> _entries = new(MaxQueuedEntries);
     private readonly object _fallbackGate = new();
     private readonly Thread _worker;
     private StreamWriter? _writer;
     private int _firstUnwrittenIndex;
     private int _disposed;
+    private int _dropped;
 
     private FileLogger(string logFilePath)
     {
@@ -60,7 +63,11 @@ internal sealed class FileLogger : IRuntimeLogger, IDisposable
                 return;
             }
 
-            _entries.Add(new LogEntry(DateTimeOffset.Now, level, message, exception));
+            // A flood (a script logging in a tight loop) must not grow memory without bound.
+            if (!_entries.TryAdd(new LogEntry(DateTimeOffset.Now, level, message, exception)))
+            {
+                Interlocked.Increment(ref _dropped);
+            }
         }
         catch
         {
@@ -144,6 +151,16 @@ internal sealed class FileLogger : IRuntimeLogger, IDisposable
         while (_entries.TryTake(out var nextEntry))
         {
             entries.Add(nextEntry);
+        }
+
+        var dropped = Interlocked.Exchange(ref _dropped, 0);
+        if (dropped > 0)
+        {
+            entries.Add(new LogEntry(
+                DateTimeOffset.Now,
+                "WARN",
+                $"Dropped {dropped} log entries because logging fell behind.",
+                null));
         }
 
         lock (_fallbackGate)
@@ -235,7 +252,10 @@ internal sealed class FileLogger : IRuntimeLogger, IDisposable
         writer.Write(entry.Level);
         writer.Write("] ");
         writer.WriteLine(entry.Message);
-        writer.WriteLine(entry.Exception);
+        if (entry.Exception is not null)
+        {
+            writer.WriteLine(entry.Exception);
+        }
     }
 
     private sealed record LogEntry(

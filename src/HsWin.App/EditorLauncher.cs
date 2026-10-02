@@ -4,11 +4,17 @@ using System.IO;
 
 namespace HsWin.App;
 
+/// <summary>
+/// Opens the config in an editor: an explicit <c>HSWIN_EDITOR</c>/<c>VISUAL</c>/<c>EDITOR</c>
+/// command, else the program Windows has registered for <c>.js</c> files, else Notepad.
+/// </summary>
 internal static class EditorLauncher
 {
     private static readonly string[] EditorEnvironmentVariables = ["HSWIN_EDITOR", "VISUAL", "EDITOR"];
 
-    public static void Open(string filePath)
+    public static void Open(string filePath) => Open(filePath, ShellFileAssociations.Instance);
+
+    internal static void Open(string filePath, IFileAssociations associations)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
 
@@ -21,12 +27,36 @@ internal static class EditorLauncher
             }
         }
 
-        if (TryStart("code", filePath))
+        if (TryOpenWithDefaultEditor(associations, filePath))
         {
             return;
         }
 
         StartProcess("notepad.exe", Quote(filePath));
+    }
+
+    private static bool TryOpenWithDefaultEditor(IFileAssociations associations, string filePath)
+    {
+        var verb = DefaultEditorSelector.SelectVerb(associations, Path.GetExtension(filePath));
+        if (verb is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = filePath,
+                Verb = verb,
+                UseShellExecute = true
+            });
+            return true;
+        }
+        catch (Win32Exception)
+        {
+            return false;
+        }
     }
 
     private static bool TryStart(string command, string filePath)

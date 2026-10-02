@@ -5,6 +5,8 @@ using System.Windows.Forms;
 using System.Windows.Media;
 using Point = System.Windows.Point;
 using Size = System.Windows.Size;
+using HsWin.App.Native;
+using HsWin.App.Threading;
 
 namespace HsWin.App;
 
@@ -25,12 +27,23 @@ internal sealed partial class CursorFollowingToastController : ICursorFollowingT
     private static readonly TimeSpan NativeFrameInterval =
         TimeSpan.FromSeconds(1d / FollowingToastStyleMetrics.TargetFrameRate);
 
+    private readonly IPreciseTimerFactory _timers;
     private IToastView? _fallbackView;
-    private System.Threading.Timer? _nativeTimer;
+    private IPreciseTimer? _nativeTimer;
     private Point _smoothedCursor;
     private long _lastTimestamp;
     private long _generation;
     private bool _subscribed;
+
+    public CursorFollowingToastController()
+        : this(PreciseTimerScheduler.Shared)
+    {
+    }
+
+    internal CursorFollowingToastController(IPreciseTimerFactory timers)
+    {
+        _timers = timers;
+    }
 
     internal bool IsUsingNativeLoop => _nativeTimer is not null;
 
@@ -77,11 +90,11 @@ internal sealed partial class CursorFollowingToastController : ICursorFollowingT
             Stopwatch.GetTimestamp(),
             generation);
         PositionNative(state, snapshot);
-        _nativeTimer = new System.Threading.Timer(
-            _ => NativeTick(state),
-            null,
-            NativeFrameInterval,
-            NativeFrameInterval);
+        // The precise scheduler keeps the advertised frame rate; a pool timer rounds to ~15.6 ms.
+        var frameMs = Math.Max(1, (int)Math.Round(NativeFrameInterval.TotalMilliseconds));
+        var timer = _timers.Create(() => NativeTick(state));
+        _nativeTimer = timer;
+        timer.Change(frameMs, frameMs);
     }
 
     private void NativeTick(NativeLoopState state)
@@ -174,7 +187,7 @@ internal sealed partial class CursorFollowingToastController : ICursorFollowingT
     private void StartCompositionFallback(IToastView view)
     {
         _fallbackView = view;
-        var snapshot = CaptureFallbackSnapshot(view);
+        var snapshot = CaptureFallbackSnapshot();
         _smoothedCursor = snapshot.Cursor;
         _lastTimestamp = Stopwatch.GetTimestamp();
         PositionFallback(view, snapshot.ScreenBounds);
@@ -197,7 +210,7 @@ internal sealed partial class CursorFollowingToastController : ICursorFollowingT
             : Stopwatch.GetElapsedTime(_lastTimestamp, timestamp);
         _lastTimestamp = timestamp;
 
-        var snapshot = CaptureFallbackSnapshot(view);
+        var snapshot = CaptureFallbackSnapshot();
         _smoothedCursor = FollowingToastMotion.SmoothCursor(
             _smoothedCursor,
             snapshot.Cursor,
@@ -216,25 +229,24 @@ internal sealed partial class CursorFollowingToastController : ICursorFollowingT
         view.Top = pillOrigin.Y - shadowInset;
     }
 
-    private static CursorSnapshot CaptureFallbackSnapshot(IToastView view)
+    private static CursorSnapshot CaptureFallbackSnapshot()
     {
         var cursor = Cursor.Position;
         var workingArea = Screen.FromPoint(cursor).WorkingArea;
-        var transform = PresentationSource.FromVisual(view.PlacementVisual)
-            ?.CompositionTarget
-            ?.TransformFromDevice
-            ?? Matrix.Identity;
 
-        var cursorPoint = transform.Transform(new Point(cursor.X, cursor.Y));
-        var topLeft = transform.Transform(new Point(workingArea.Left, workingArea.Top));
-        var bottomRight = transform.Transform(new Point(workingArea.Right, workingArea.Bottom));
-        return new CursorSnapshot(cursorPoint, new Rect(topLeft, bottomRight));
+        // Convert with the target monitor's DPI; the toast may still sit on another monitor.
+        var scale = ScreenGeometry.GetScaleAt(cursor.X, cursor.Y);
+        return new CursorSnapshot(
+            new Point(cursor.X / scale, cursor.Y / scale),
+            new Rect(
+                new Point(workingArea.Left / scale, workingArea.Top / scale),
+                new Point(workingArea.Right / scale, workingArea.Bottom / scale)));
     }
 
     private static bool TryGetCursor(out Point cursor)
     {
         cursor = default;
-        if (!NativeMethods.GetCursorPos(out var nativeCursor))
+        if (!ScreenGeometry.TryGetCursor(out var nativeCursor))
         {
             return false;
         }
@@ -249,44 +261,29 @@ internal sealed partial class CursorFollowingToastController : ICursorFollowingT
         out NativeSnapshot snapshot)
     {
         snapshot = default;
-        if (!NativeMethods.GetWindowRect(handle, out var windowRect))
+        if (!ScreenGeometry.TryGetWindowRect(handle, out var windowRect))
         {
             return false;
         }
 
-        var nativeCursor = new NativePoint
+        var monitor = ScreenGeometry.MonitorFromPoint(new NativePoint
         {
             X = (int)Math.Round(cursor.X),
             Y = (int)Math.Round(cursor.Y)
-        };
-        var monitor = NativeMethods.MonitorFromPoint(nativeCursor, NativeMethods.NearestMonitor);
-        var monitorInfo = new NativeMonitorInfo
-        {
-            Size = (uint)Marshal.SizeOf<NativeMonitorInfo>()
-        };
-        if (monitor == nint.Zero || !NativeMethods.GetMonitorInfo(monitor, ref monitorInfo))
+        });
+        if (!ScreenGeometry.TryGetMonitorInfo(monitor, out var monitorInfo))
         {
             return false;
         }
 
-        var dpi = NativeMethods.GetDpiForWindow(handle);
-        var scale = dpi > 0 ? dpi / 96d : 1d;
+        // The toast is placed on the cursor's monitor, so that monitor's DPI decides its metrics,
+        // not the DPI of whichever monitor the window happens to be on now.
         snapshot = new NativeSnapshot(
             cursor,
-            new Rect(
-                monitorInfo.Work.Left,
-                monitorInfo.Work.Top,
-                monitorInfo.Work.Right - monitorInfo.Work.Left,
-                monitorInfo.Work.Bottom - monitorInfo.Work.Top),
-            new Rect(
-                monitorInfo.Monitor.Left,
-                monitorInfo.Monitor.Top,
-                monitorInfo.Monitor.Right - monitorInfo.Monitor.Left,
-                monitorInfo.Monitor.Bottom - monitorInfo.Monitor.Top),
-            new Size(
-                windowRect.Right - windowRect.Left,
-                windowRect.Bottom - windowRect.Top),
-            scale);
+            new Rect(monitorInfo.WorkArea.Left, monitorInfo.WorkArea.Top, monitorInfo.WorkArea.Width, monitorInfo.WorkArea.Height),
+            new Rect(monitorInfo.Monitor.Left, monitorInfo.Monitor.Top, monitorInfo.Monitor.Width, monitorInfo.Monitor.Height),
+            new Size(windowRect.Width, windowRect.Height),
+            ScreenGeometry.GetScale(monitor));
         return true;
     }
 
@@ -324,56 +321,12 @@ internal sealed partial class CursorFollowingToastController : ICursorFollowingT
         public int TickActive;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct NativePoint
-    {
-        public int X;
-        public int Y;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct NativeRect
-    {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct NativeMonitorInfo
-    {
-        public uint Size;
-        public NativeRect Monitor;
-        public NativeRect Work;
-        public uint Flags;
-    }
-
     private static partial class NativeMethods
     {
-        internal const uint NearestMonitor = 2;
         internal const uint DoNotSize = 0x0001;
         internal const uint DoNotChangeZOrder = 0x0004;
         internal const uint DoNotActivate = 0x0010;
         internal const uint DoNotChangeOwnerZOrder = 0x0200;
-
-        [LibraryImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        internal static partial bool GetCursorPos(out NativePoint point);
-
-        [LibraryImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        internal static partial bool GetWindowRect(nint windowHandle, out NativeRect rectangle);
-
-        [LibraryImport("user32.dll")]
-        internal static partial nint MonitorFromPoint(NativePoint point, uint flags);
-
-        [LibraryImport("user32.dll", EntryPoint = "GetMonitorInfoW")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        internal static partial bool GetMonitorInfo(nint monitor, ref NativeMonitorInfo monitorInfo);
-
-        [LibraryImport("user32.dll")]
-        internal static partial uint GetDpiForWindow(nint windowHandle);
 
         [LibraryImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

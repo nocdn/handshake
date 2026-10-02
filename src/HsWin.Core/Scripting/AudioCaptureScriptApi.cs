@@ -35,30 +35,12 @@ public sealed class AudioCaptureScriptApi
         }
 
         var parsedOptions = ParseRecordingOptions(options);
-        var disposed = 0;
-        var session = _audioCapture.Record(parsedOptions, audioEvent =>
-        {
-            if (Volatile.Read(ref disposed) != 0)
-            {
-                return;
-            }
-
-            var eventJson = ScriptJson.Serialize(audioEvent);
-            _callbackScheduler.Schedule(() =>
-            {
-                if (Volatile.Read(ref disposed) == 0)
-                {
-                    _callbacks.InvokeScriptCallback(scriptFunction, eventJson);
-                }
-            });
-        });
-
-        var handle = new AudioRecordingScriptHandle(
-            session,
-            () => Interlocked.Exchange(ref disposed, 1));
+        var relay = new ScriptCallbackRelay(scriptFunction, _callbackScheduler, _callbacks);
+        var session = _audioCapture.Record(parsedOptions, audioEvent => Deliver(relay, audioEvent));
+        var handle = relay.AttachHandle(new AudioRecordingScriptHandle(session, relay));
         _trackResource(handle);
         _logger.Info(
-            $"Script hs.audio.record() started path='{session.Path}' format='{parsedOptions.Format.ToString().ToLowerInvariant()}' " +
+            $"Script hs.audio.record() started format='{parsedOptions.Format.ToFileExtension()}' " +
             $"levelIntervalMs={parsedOptions.LevelIntervalMs.ToString(CultureInfo.InvariantCulture)}.");
         return handle;
     }
@@ -71,30 +53,25 @@ public sealed class AudioCaptureScriptApi
         }
 
         var parsedOptions = ParseLevelWatchOptions(options);
-        var disposed = 0;
-        var watch = _audioCapture.WatchLevels(parsedOptions, audioEvent =>
-        {
-            if (Volatile.Read(ref disposed) != 0)
-            {
-                return;
-            }
-
-            var eventJson = ScriptJson.Serialize(audioEvent);
-            _callbackScheduler.Schedule(() =>
-            {
-                if (Volatile.Read(ref disposed) == 0)
-                {
-                    _callbacks.InvokeScriptCallback(scriptFunction, eventJson);
-                }
-            });
-        });
-
-        var handle = new ScriptResourceHandle(new CallbackSuppressingDisposable(
-            watch,
-            () => Interlocked.Exchange(ref disposed, 1)));
+        var relay = new ScriptCallbackRelay(scriptFunction, _callbackScheduler, _callbacks);
+        var watch = _audioCapture.WatchLevels(parsedOptions, audioEvent => relay.Post(ScriptJson.Serialize(audioEvent)));
+        var handle = relay.Attach(watch);
         _trackResource(handle);
         _logger.Info($"Script hs.audio.levels() started intervalMs={parsedOptions.IntervalMs.ToString(CultureInfo.InvariantCulture)}.");
         return handle;
+    }
+
+    private static void Deliver(ScriptCallbackRelay relay, AudioCaptureEvent audioEvent)
+    {
+        var eventJson = ScriptJson.Serialize(audioEvent);
+        if (audioEvent.IsTerminal)
+        {
+            relay.PostFinal(eventJson);
+        }
+        else
+        {
+            relay.Post(eventJson);
+        }
     }
 
     public static AudioRecordingOptions ParseRecordingOptions(object? value)
@@ -127,8 +104,9 @@ public sealed class AudioCaptureScriptApi
             ScriptArgumentReader.OptionalString(ScriptArgumentReader.GetPropertyValue(value, "deviceId", "device", "inputDeviceId")),
             path,
             InferFormat(path, formatText),
-            ConvertOptionalBoolean(
+            ScriptArgumentReader.OptionalBoolean(
                 ScriptArgumentReader.GetPropertyValue(value, "overwrite", "replace"),
+                "overwrite",
                 AudioRecordingOptions.Default.Overwrite),
             ConvertBitrateKbps(bitrateValue, quality),
             ConvertLevelInterval(levelIntervalValue, AudioRecordingOptions.DefaultLevelIntervalMs),
@@ -252,28 +230,4 @@ public sealed class AudioCaptureScriptApi
         return result;
     }
 
-    private static bool ConvertOptionalBoolean(object? value, bool defaultValue)
-    {
-        return ScriptArgumentReader.IsMissing(value)
-            ? defaultValue
-            : Convert.ToBoolean(value, CultureInfo.InvariantCulture);
-    }
-
-    private sealed class CallbackSuppressingDisposable : IDisposable
-    {
-        private readonly IDisposable _inner;
-        private readonly Action _markDisposed;
-
-        public CallbackSuppressingDisposable(IDisposable inner, Action markDisposed)
-        {
-            _inner = inner;
-            _markDisposed = markDisposed;
-        }
-
-        public void Dispose()
-        {
-            _markDisposed();
-            _inner.Dispose();
-        }
-    }
 }

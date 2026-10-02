@@ -1,3 +1,5 @@
+using HsWin.Core.Support;
+
 namespace HsWin.Core.Timers;
 
 public sealed class NullScriptTimerService : IScriptTimerService
@@ -10,18 +12,11 @@ public sealed class NullScriptTimerService : IScriptTimerService
 
     public IDisposable DoAfter(int delayMs, Action callback)
     {
-        return new NullDisposable();
+        return EmptyDisposable.Instance;
     }
 
     public IDisposable DoEvery(int intervalMs, Action callback)
     {
-        return new NullDisposable();
-    }
-
-    private sealed class NullDisposable : IDisposable
-    {
-        public void Dispose()
-        {
-        }
+        return EmptyDisposable.Instance;
     }
 }

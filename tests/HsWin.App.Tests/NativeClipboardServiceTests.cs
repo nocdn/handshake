@@ -11,7 +11,7 @@ public sealed class NativeClipboardServiceTests
     {
         var textStore = new CapturingClipboardTextStore("npm install react", hasText: true);
         var notifier = new CapturingClipboardChangeNotifier();
-        using var service = new NativeClipboardService(textStore, notifier, NullRuntimeLogger.Instance);
+        using var service = new NativeClipboardService(textStore, notifier);
         var snapshots = new List<ClipboardChangeSnapshot>();
 
         using var watch = service.Watch(snapshots.Add);
@@ -40,7 +40,7 @@ public sealed class NativeClipboardServiceTests
     {
         var textStore = new CapturingClipboardTextStore("npm install react", hasText: true);
         var notifier = new CapturingClipboardChangeNotifier();
-        using var service = new NativeClipboardService(textStore, notifier, NullRuntimeLogger.Instance);
+        using var service = new NativeClipboardService(textStore, notifier);
         var count = 0;
 
         var watch = service.Watch(_ => count++);
@@ -68,6 +68,10 @@ public sealed class NativeClipboardServiceTests
         {
             Contents = new ClipboardTextContents(text, text.Length > 0);
             return true;
+        }
+
+        public void Dispose()
+        {
         }
     }
 

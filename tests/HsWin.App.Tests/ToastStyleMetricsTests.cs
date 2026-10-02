@@ -19,7 +19,6 @@ public sealed class ToastStyleMetricsTests
     public void ToastDotUsesRequestedSizeAndGap()
     {
         Assert.Equal(6, ToastStyleMetrics.DotSize);
-        Assert.Equal(10, ToastStyleMetrics.DotTextGap);
         Assert.Equal(-0.75, ToastStyleMetrics.DotTranslateY);
         Assert.Equal(14, ToastStyleMetrics.IconSlotSize);
         Assert.Equal(14, ToastStyleMetrics.LoaderIconSize);
@@ -30,7 +29,6 @@ public sealed class ToastStyleMetricsTests
     [Fact]
     public void ToastPaddingPreservesRobinInspiredInsets()
     {
-        Assert.Equal(17, ToastStyleMetrics.DotStateLeftPadding);
         Assert.Equal(13, ToastStyleMetrics.IconStateLeftPadding);
         Assert.Equal(18, ToastStyleMetrics.DotStateRightPadding);
         Assert.Equal(17, ToastStyleMetrics.NormalHorizontalPadding);

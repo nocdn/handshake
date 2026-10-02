@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using HsWin.App.Keyboard;
+using HsWin.App.Threading;
 using HsWin.Core.Hotkeys;
+using HsWin.Core.Input;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
 
@@ -11,54 +13,63 @@ internal sealed class KeyboardInputService : IKeyboardInputService
     private readonly IRuntimeLogger _logger;
     private readonly IKeyboardInputSender _inputSender;
     private readonly IKeyboardEventService _keyboardEvents;
-    private readonly object _repeatStartGate = new();
-    private readonly object _repeatGate = new();
-    private KeyboardRepeatHandle? _activeRepeat;
-
-    public KeyboardInputService(IRuntimeLogger logger)
-        : this(logger, NativeKeyboardInputSender.Instance, NullKeyboardEventService.Instance)
-    {
-    }
+    private readonly IPreciseTimerFactory _timers;
+    private readonly ActiveRepeatSlot<KeyboardRepeatHandle> _repeat;
+    private readonly object _heldGate = new();
+    private readonly HashSet<uint> _heldKeys = [];
 
     public KeyboardInputService(IRuntimeLogger logger, IKeyboardEventService keyboardEvents)
-        : this(logger, NativeKeyboardInputSender.Instance, keyboardEvents)
+        : this(logger, NativeKeyboardInputSender.Instance, keyboardEvents, PreciseTimerScheduler.Shared)
     {
     }
 
     internal KeyboardInputService(
         IRuntimeLogger logger,
         IKeyboardInputSender inputSender,
-        IKeyboardEventService? keyboardEvents = null)
+        IKeyboardEventService? keyboardEvents = null,
+        IPreciseTimerFactory? timers = null)
     {
         _logger = logger;
         _inputSender = inputSender;
         _keyboardEvents = keyboardEvents ?? NullKeyboardEventService.Instance;
+        _timers = timers ?? PreciseTimerScheduler.Shared;
+        _repeat = new ActiveRepeatSlot<KeyboardRepeatHandle>("keyboard", logger);
     }
 
     public void KeyDown(uint virtualKey)
     {
-        var description = FormatInputAction("keyDown", virtualKey);
-        if (KeyboardHookDispatchScope.TryDefer(
-            () => _inputSender.SendKeyDown(virtualKey, KeyboardInputMethod.SendInput, _logger),
-            description))
-        {
-            return;
-        }
-
-        _inputSender.SendKeyDown(virtualKey, KeyboardInputMethod.SendInput, _logger);
+        TrackHeldKey(virtualKey);
+        SendOrDefer(() => _inputSender.SendKeyDown(virtualKey, InputMethod.SendInput, _logger));
     }
 
     public void KeyUp(uint virtualKey)
     {
-        var description = FormatInputAction("keyUp", virtualKey);
-        if (KeyboardHookDispatchScope.TryDefer(
-            () => _inputSender.SendKeyUp(virtualKey, KeyboardInputMethod.SendInput, _logger),
-            description))
+        UntrackHeldKey(virtualKey);
+        SendOrDefer(() => _inputSender.SendKeyUp(virtualKey, InputMethod.SendInput, _logger));
+    }
+
+    public void ReleaseHeldKeys()
+    {
+        uint[] held;
+        lock (_heldGate)
         {
-            return;
+            if (_heldKeys.Count == 0)
+            {
+                return;
+            }
+
+            held = [.. _heldKeys];
+            _heldKeys.Clear();
         }
 
-        _inputSender.SendKeyUp(virtualKey, KeyboardInputMethod.SendInput, _logger);
+        _logger.Info($"Releasing {held.Length} script-held key(s).");
+        SendOrDefer(() =>
+        {
+            foreach (var virtualKey in held)
+            {
+                _inputSender.SendKeyUp(virtualKey, InputMethod.SendInput, _logger);
+            }
+        });
     }
 
     public void Tap(uint virtualKey, KeyboardTapOptions options)
@@ -68,91 +79,56 @@ internal sealed class KeyboardInputService : IKeyboardInputService
         var suppressedModifiers = GetCurrentlyDownModifiers(options.SuppressPhysicalModifiers);
         var modifiers = KeyboardKeyRules.GetModifierVirtualKeys(options.Modifiers);
         var inputMethod = options.InputMethod;
-        var description = FormatInputAction("tap", virtualKey);
-        if (KeyboardHookDispatchScope.TryDefer(
-            () => _inputSender.SendTap(virtualKey, suppressedModifiers, modifiers, inputMethod, _logger),
-            description))
-        {
-            return;
-        }
-
-        _inputSender.SendTap(virtualKey, suppressedModifiers, modifiers, inputMethod, _logger);
+        SendOrDefer(() => _inputSender.SendTap(virtualKey, suppressedModifiers, modifiers, inputMethod, _logger));
     }
 
-    public IKeyboardRepeatSession Repeat(uint virtualKey, KeyboardRepeatOptions options)
+    public IRepeatSession Repeat(uint virtualKey, KeyboardRepeatOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        ValidateRepeatOptions(options);
+        RepeatTiming.ValidateIntervalMs(options.IntervalMs, nameof(options));
+        RepeatTiming.ValidateKeyDownMs(options.KeyDownMs, options.IntervalMs, nameof(options));
 
-        lock (_repeatStartGate)
-        {
-            KeyboardRepeatHandle? previousRepeat;
-            lock (_repeatGate)
-            {
-                previousRepeat = _activeRepeat;
-                _activeRepeat = null;
-            }
-
-            if (previousRepeat is not null)
-            {
-                _logger.Warning("Replacing active keyboard repeat before starting a new repeat.");
-                previousRepeat.Dispose();
-            }
-
-            var suppressedModifiers = GetCurrentlyDownModifiers(options.SuppressPhysicalModifiers);
-            var repeater = new KeyboardRepeatHandle(
+        return _repeat.Start(
+            () => new KeyboardRepeatHandle(
                 virtualKey,
                 options,
-                suppressedModifiers,
+                GetCurrentlyDownModifiers(options.SuppressPhysicalModifiers),
+                KeyboardKeyRules.GetModifierVirtualKeys(options.Modifiers),
                 _logger,
                 _inputSender,
                 _keyboardEvents,
-                ClearActiveRepeat);
-            lock (_repeatGate)
-            {
-                _activeRepeat = repeater;
-            }
+                _timers,
+                _repeat.Clear),
+            repeat => repeat.Start());
+    }
 
-            try
-            {
-                repeater.Start();
-                return repeater;
-            }
-            catch
-            {
-                ClearActiveRepeat(repeater);
-                repeater.Dispose();
-                throw;
-            }
+    public void StopActiveRepeat() => _repeat.StopActive();
+
+    /// <summary>
+    /// Input requested from inside a blocking keyboard hook dispatch (a remap) must wait until
+    /// the hook returns; everything else is sent immediately.
+    /// </summary>
+    private static void SendOrDefer(Action send)
+    {
+        if (!KeyboardHookDispatchScope.TryDefer(send))
+        {
+            send();
         }
     }
 
-    public void StopActiveRepeat()
+    private void TrackHeldKey(uint virtualKey)
     {
-        KeyboardRepeatHandle? active;
-        lock (_repeatGate)
+        lock (_heldGate)
         {
-            active = _activeRepeat;
-            _activeRepeat = null;
+            _heldKeys.Add(virtualKey);
         }
-
-        if (active is null)
-        {
-            return;
-        }
-
-        _logger.Info("Stopping active keyboard repeat via StopActiveRepeat().");
-        active.Dispose();
     }
 
-    private void ClearActiveRepeat(KeyboardRepeatHandle repeat)
+    private void UntrackHeldKey(uint virtualKey)
     {
-        lock (_repeatGate)
+        lock (_heldGate)
         {
-            if (ReferenceEquals(_activeRepeat, repeat))
-            {
-                _activeRepeat = null;
-            }
+            _heldKeys.Remove(virtualKey);
         }
     }
 
@@ -164,34 +140,17 @@ internal sealed class KeyboardInputService : IKeyboardInputService
 
         if ((modifiers & HotkeyModifiers.Control) != 0)
         {
-            AddIfDown(down, KeyboardKeyRules.VkLeftControl);
-            AddIfDown(down, KeyboardKeyRules.VkRightControl);
-            if (down.Count == 0)
-            {
-                AddIfDown(down, KeyboardKeyRules.VkControl);
-            }
+            AddPhysicalModifier(down, KeyboardKeyRules.VkLeftControl, KeyboardKeyRules.VkRightControl, KeyboardKeyRules.VkControl);
         }
 
         if ((modifiers & HotkeyModifiers.Shift) != 0)
         {
-            var before = down.Count;
-            AddIfDown(down, KeyboardKeyRules.VkLeftShift);
-            AddIfDown(down, KeyboardKeyRules.VkRightShift);
-            if (down.Count == before)
-            {
-                AddIfDown(down, KeyboardKeyRules.VkShift);
-            }
+            AddPhysicalModifier(down, KeyboardKeyRules.VkLeftShift, KeyboardKeyRules.VkRightShift, KeyboardKeyRules.VkShift);
         }
 
         if ((modifiers & HotkeyModifiers.Alt) != 0)
         {
-            var before = down.Count;
-            AddIfDown(down, KeyboardKeyRules.VkLeftMenu);
-            AddIfDown(down, KeyboardKeyRules.VkRightMenu);
-            if (down.Count == before)
-            {
-                AddIfDown(down, KeyboardKeyRules.VkMenu);
-            }
+            AddPhysicalModifier(down, KeyboardKeyRules.VkLeftMenu, KeyboardKeyRules.VkRightMenu, KeyboardKeyRules.VkMenu);
         }
 
         if ((modifiers & HotkeyModifiers.Win) != 0)
@@ -203,6 +162,17 @@ internal sealed class KeyboardInputService : IKeyboardInputService
         return down;
     }
 
+    private void AddPhysicalModifier(List<uint> keys, uint left, uint right, uint generic)
+    {
+        var before = keys.Count;
+        AddIfDown(keys, left);
+        AddIfDown(keys, right);
+        if (keys.Count == before)
+        {
+            AddIfDown(keys, generic);
+        }
+    }
+
     private void AddIfDown(List<uint> keys, uint virtualKey)
     {
         if (_keyboardEvents.IsKeyDown(virtualKey))
@@ -211,42 +181,28 @@ internal sealed class KeyboardInputService : IKeyboardInputService
         }
     }
 
-    private static string FormatInputAction(string action, uint virtualKey)
+    /// <summary>
+    /// One running repeat. Instantaneous repeats tap on a periodic timer; pulse repeats
+    /// (<see cref="KeyboardRepeatOptions.KeyDownMs"/> &gt; 0) alternate a held phase and a released
+    /// phase with one-shot timer deadlines.
+    /// </summary>
+    private sealed class KeyboardRepeatHandle : IRepeatSession
     {
-        return $"{action} key='{KeyboardKeyRules.GetDisplayName(virtualKey)}' vk=0x{virtualKey:X2}";
-    }
+        private const int ProgressLogEveryTicks = 250;
 
-    private static void ValidateRepeatOptions(KeyboardRepeatOptions options)
-    {
-        if (options.IntervalMs is < KeyboardRepeatOptions.MinimumIntervalMs or > KeyboardRepeatOptions.MaximumIntervalMs)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(options),
-                $"Keyboard repeat interval must be between {KeyboardRepeatOptions.MinimumIntervalMs} and {KeyboardRepeatOptions.MaximumIntervalMs} milliseconds.");
-        }
-
-        if (options.KeyDownMs < 0 || options.KeyDownMs >= options.IntervalMs)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(options),
-                $"Keyboard repeat keyDownMs must be at least 0 and less than intervalMs ({options.IntervalMs}).");
-        }
-    }
-
-    private sealed class KeyboardRepeatHandle : IKeyboardRepeatSession
-    {
         private readonly uint _virtualKey;
         private readonly HotkeyModifiers _suppressPhysicalModifiers;
-        private readonly KeyboardInputMethod _inputMethod;
+        private readonly InputMethod _inputMethod;
         private readonly int _keyDownMs;
         private readonly IReadOnlyList<uint> _suppressedModifiers;
+        private readonly IReadOnlyList<uint> _modifiers;
         private readonly IRuntimeLogger _logger;
         private readonly IKeyboardInputSender _inputSender;
         private readonly IKeyboardEventService _keyboardEvents;
         private readonly Action<KeyboardRepeatHandle> _clearActiveRepeat;
         private readonly object _gate = new();
         private readonly Stopwatch _stopwatch = new();
-        private readonly System.Threading.Timer _timer;
+        private readonly IPreciseTimer _timer;
 
         private int _intervalMs;
         private bool _disposed;
@@ -259,9 +215,11 @@ internal sealed class KeyboardInputService : IKeyboardInputService
             uint virtualKey,
             KeyboardRepeatOptions options,
             IReadOnlyList<uint> suppressedModifiers,
+            IReadOnlyList<uint> modifiers,
             IRuntimeLogger logger,
             IKeyboardInputSender inputSender,
             IKeyboardEventService keyboardEvents,
+            IPreciseTimerFactory timers,
             Action<KeyboardRepeatHandle> clearActiveRepeat)
         {
             _virtualKey = virtualKey;
@@ -270,11 +228,12 @@ internal sealed class KeyboardInputService : IKeyboardInputService
             _inputMethod = options.InputMethod;
             _keyDownMs = options.KeyDownMs;
             _suppressedModifiers = suppressedModifiers;
+            _modifiers = modifiers;
             _logger = logger;
             _inputSender = inputSender;
             _keyboardEvents = keyboardEvents;
             _clearActiveRepeat = clearActiveRepeat;
-            _timer = new System.Threading.Timer(_ => Tick(), null, Timeout.Infinite, Timeout.Infinite);
+            _timer = timers.Create(Tick);
         }
 
         public int IntervalMs
@@ -290,52 +249,36 @@ internal sealed class KeyboardInputService : IKeyboardInputService
 
         public void Start()
         {
-            int intervalMs;
             lock (_gate)
             {
-                intervalMs = _intervalMs;
-            }
+                _stopwatch.Start();
+                RegisterPhysicalModifierSuppression();
+                _logger.Info(
+                    $"Keyboard repeat started vk=0x{_virtualKey:X2} intervalMs={_intervalMs} keyDownMs={_keyDownMs} " +
+                    $"modifiers={_modifiers.Count} suppressModifiers=0x{(uint)_suppressPhysicalModifiers:X} " +
+                    $"inputMethod={InputMethodParser.GetDisplayName(_inputMethod)}.");
+                ReleaseSuppressedModifiers();
+                if (_keyDownMs == 0)
+                {
+                    SendTap();
+                    _timer.Change(_intervalMs, _intervalMs);
+                }
+                else
+                {
+                    PressRepeatKey();
+                    _timer.Change(_keyDownMs, Timeout.Infinite);
+                }
 
-            _stopwatch.Start();
-            RegisterPhysicalModifierSuppression();
-            _logger.Info(
-                $"Keyboard repeat started vk=0x{_virtualKey:X2} intervalMs={intervalMs} " +
-                $"keyDownMs={_keyDownMs} " +
-                $"suppressModifiers=0x{(uint)_suppressPhysicalModifiers:X} " +
-                $"inputMethod={KeyboardInputMethodParser.GetDisplayName(_inputMethod)}.");
-            ReleaseSuppressedModifiers();
-            if (_keyDownMs == 0)
-            {
-                _inputSender.SendTap(_virtualKey, inputMethod: _inputMethod, logger: _logger);
-                _timer.Change(intervalMs, intervalMs);
+                _tickCount++;
             }
-            else
-            {
-                _inputSender.SendKeyDown(_virtualKey, _inputMethod, _logger);
-                _repeatKeyIsDown = true;
-                _timer.Change(_keyDownMs, Timeout.Infinite);
-            }
-
-            _tickCount++;
         }
 
         public void SetIntervalMs(int intervalMs)
         {
-            if (intervalMs is < KeyboardRepeatOptions.MinimumIntervalMs or > KeyboardRepeatOptions.MaximumIntervalMs)
-            {
-                throw new ArgumentOutOfRangeException(
-                    nameof(intervalMs),
-                    $"Keyboard repeat interval must be between {KeyboardRepeatOptions.MinimumIntervalMs} and {KeyboardRepeatOptions.MaximumIntervalMs} milliseconds.");
-            }
-
+            RepeatTiming.ValidateIntervalMs(intervalMs, nameof(intervalMs));
             lock (_gate)
             {
-                if (_disposed)
-                {
-                    return;
-                }
-
-                if (_intervalMs == intervalMs)
+                if (_disposed || _intervalMs == intervalMs)
                 {
                     return;
                 }
@@ -371,7 +314,6 @@ internal sealed class KeyboardInputService : IKeyboardInputService
                 }
 
                 _disposed = true;
-                _timer.Change(Timeout.Infinite, Timeout.Infinite);
                 _timer.Dispose();
                 ReleaseRepeatKeys();
                 _physicalModifierSuppression?.Dispose();
@@ -395,25 +337,22 @@ internal sealed class KeyboardInputService : IKeyboardInputService
                 {
                     if (_keyDownMs == 0)
                     {
-                        _inputSender.SendTap(_virtualKey, inputMethod: _inputMethod, logger: _logger);
-                        _tickCount++;
-                        LogProgressIfNeeded();
-                        return;
+                        SendTap();
                     }
-
-                    if (_repeatKeyIsDown)
+                    else if (_repeatKeyIsDown)
                     {
-                        _inputSender.SendKeyUp(_virtualKey, _inputMethod, _logger);
-                        _repeatKeyIsDown = false;
+                        ReleaseRepeatKey();
                         _timer.Change(_intervalMs - _keyDownMs, Timeout.Infinite);
                         return;
                     }
+                    else
+                    {
+                        PressRepeatKey();
+                        _timer.Change(_keyDownMs, Timeout.Infinite);
+                    }
 
-                    _inputSender.SendKeyDown(_virtualKey, _inputMethod, _logger);
-                    _repeatKeyIsDown = true;
                     _tickCount++;
                     LogProgressIfNeeded();
-                    _timer.Change(_keyDownMs, Timeout.Infinite);
                 }
                 catch (Exception exception)
                 {
@@ -423,16 +362,43 @@ internal sealed class KeyboardInputService : IKeyboardInputService
             }
         }
 
+        private void SendTap()
+        {
+            _inputSender.SendTap(_virtualKey, modifierVirtualKeys: _modifiers, inputMethod: _inputMethod, logger: _logger);
+        }
+
+        private void PressRepeatKey()
+        {
+            foreach (var modifier in _modifiers)
+            {
+                _inputSender.SendKeyDown(modifier, _inputMethod, _logger);
+            }
+
+            _inputSender.SendKeyDown(_virtualKey, _inputMethod, _logger);
+            _repeatKeyIsDown = true;
+        }
+
+        private void ReleaseRepeatKey()
+        {
+            _inputSender.SendKeyUp(_virtualKey, _inputMethod, _logger);
+            for (var index = _modifiers.Count - 1; index >= 0; index--)
+            {
+                _inputSender.SendKeyUp(_modifiers[index], _inputMethod, _logger);
+            }
+
+            _repeatKeyIsDown = false;
+        }
+
         private void ReleaseSuppressedModifiers()
         {
             foreach (var modifierVirtualKey in _suppressedModifiers)
             {
                 // SendInput updates global key state; a matching window message also clears state
                 // already observed by a game that ignores injected SendInput events.
-                _inputSender.SendKeyUp(modifierVirtualKey, KeyboardInputMethod.SendInput, _logger);
-                if (_inputMethod == KeyboardInputMethod.WindowMessage)
+                _inputSender.SendKeyUp(modifierVirtualKey, InputMethod.SendInput, _logger);
+                if (_inputMethod == InputMethod.WindowMessage)
                 {
-                    _inputSender.SendKeyUp(modifierVirtualKey, KeyboardInputMethod.WindowMessage, _logger);
+                    _inputSender.SendKeyUp(modifierVirtualKey, InputMethod.WindowMessage, _logger);
                 }
             }
         }
@@ -441,16 +407,17 @@ internal sealed class KeyboardInputService : IKeyboardInputService
         {
             try
             {
-                _inputSender.SendKeyUp(_virtualKey, _inputMethod, _logger);
-                _repeatKeyIsDown = false;
-                foreach (var modifierVirtualKey in _suppressedModifiers)
+                if (_repeatKeyIsDown)
                 {
-                    _inputSender.SendKeyUp(modifierVirtualKey, KeyboardInputMethod.SendInput, _logger);
-                    if (_inputMethod == KeyboardInputMethod.WindowMessage)
-                    {
-                        _inputSender.SendKeyUp(modifierVirtualKey, KeyboardInputMethod.WindowMessage, _logger);
-                    }
+                    ReleaseRepeatKey();
                 }
+                else
+                {
+                    // Belt and braces: a target that missed a key-up must not keep the key held.
+                    _inputSender.SendKeyUp(_virtualKey, _inputMethod, _logger);
+                }
+
+                ReleaseSuppressedModifiers();
             }
             catch (Exception exception)
             {
@@ -465,68 +432,34 @@ internal sealed class KeyboardInputService : IKeyboardInputService
                 return;
             }
 
-            var keyFilter = BuildPhysicalModifierKeyFilter(_suppressPhysicalModifiers);
             _physicalModifierSuppression = _keyboardEvents.Watch(
                 new KeyboardEventWatchOptions(
                     IncludeInjected: false,
                     Blocking: true,
-                    KeyFilter: keyFilter),
+                    KeyFilter: KeyboardKeyRules.GetAllModifierVirtualKeys(_suppressPhysicalModifiers)),
                 _ => true);
-        }
-
-        private static IReadOnlySet<uint> BuildPhysicalModifierKeyFilter(HotkeyModifiers modifiers)
-        {
-            var keys = new HashSet<uint>();
-            if ((modifiers & HotkeyModifiers.Control) != 0)
-            {
-                keys.Add(KeyboardKeyRules.VkControl);
-                keys.Add(KeyboardKeyRules.VkLeftControl);
-                keys.Add(KeyboardKeyRules.VkRightControl);
-            }
-
-            if ((modifiers & HotkeyModifiers.Shift) != 0)
-            {
-                keys.Add(KeyboardKeyRules.VkShift);
-                keys.Add(KeyboardKeyRules.VkLeftShift);
-                keys.Add(KeyboardKeyRules.VkRightShift);
-            }
-
-            if ((modifiers & HotkeyModifiers.Alt) != 0)
-            {
-                keys.Add(KeyboardKeyRules.VkMenu);
-                keys.Add(KeyboardKeyRules.VkLeftMenu);
-                keys.Add(KeyboardKeyRules.VkRightMenu);
-            }
-
-            if ((modifiers & HotkeyModifiers.Win) != 0)
-            {
-                keys.Add(KeyboardKeyRules.VkLeftWin);
-                keys.Add(KeyboardKeyRules.VkRightWin);
-            }
-
-            return keys;
         }
 
         private void LogProgressIfNeeded()
         {
-            if (_tickCount - _lastLoggedTickCount < 250)
+            if (_tickCount - _lastLoggedTickCount < ProgressLogEveryTicks)
             {
                 return;
             }
 
             _lastLoggedTickCount = _tickCount;
             var elapsedMs = Math.Max(1, _stopwatch.Elapsed.TotalMilliseconds);
-            var effectiveIntervalMs = elapsedMs / _tickCount;
             _logger.Info(
-                $"Keyboard repeat progress vk=0x{_virtualKey:X2} ticks={_tickCount} elapsedMs={elapsedMs:F0} effectiveIntervalMs={effectiveIntervalMs:F2}.");
+                $"Keyboard repeat progress vk=0x{_virtualKey:X2} ticks={_tickCount} elapsedMs={elapsedMs:F0} " +
+                $"effectiveIntervalMs={elapsedMs / _tickCount:F2}.");
         }
 
         private void LogStop()
         {
             var elapsedMs = Math.Max(1, _stopwatch.Elapsed.TotalMilliseconds);
-            var effectiveIntervalMs = elapsedMs / Math.Max(1, _tickCount);
             _logger.Info(
-                $"Keyboard repeat stopped vk=0x{_virtualKey:X2} ticks={_tickCount} elapsedMs={elapsedMs:F0} requestedIntervalMs={_intervalMs} effectiveIntervalMs={effectiveIntervalMs:F2}.");
+                $"Keyboard repeat stopped vk=0x{_virtualKey:X2} ticks={_tickCount} elapsedMs={elapsedMs:F0} " +
+                $"requestedIntervalMs={_intervalMs} effectiveIntervalMs={elapsedMs / Math.Max(1, _tickCount):F2}.");
         }
     }
 }

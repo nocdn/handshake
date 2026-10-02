@@ -1,3 +1,4 @@
+using HsWin.Core.Scripting;
 using HsWin.App.Keyboard;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
@@ -28,7 +29,27 @@ public sealed class KeyboardWatchDispatcherTests
         scheduled();
 
         Assert.True(called);
-        Assert.Contains(logger.Warnings, warning => warning.Contains("non-blocking watcher", StringComparison.Ordinal));
+        var warning = Assert.Single(logger.Warnings);
+        Assert.Contains("not blocking", warning, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NonBlockingWatcherReturningTrueWarnsOncePerWatchNotPerKey()
+    {
+        var scheduler = new CapturingKeyboardScheduler();
+        var logger = new CapturingRuntimeLogger();
+        var dispatcher = new KeyboardWatchDispatcher(logger, scheduler);
+        var subscription = CreateSubscription(blocking: false, _ => true);
+
+        for (var key = 0; key < 25; key++)
+        {
+            dispatcher.Dispatch(CreateSnapshot(), [subscription]);
+        }
+
+        scheduler.Callbacks.ForEach(callback => callback());
+
+        Assert.Equal(25, scheduler.Callbacks.Count);
+        Assert.Single(logger.Warnings);
     }
 
     [Fact]
@@ -255,7 +276,7 @@ public sealed class KeyboardWatchDispatcherTests
             IsExtended: false);
     }
 
-    private sealed class CapturingKeyboardScheduler : IKeyboardWatchCallbackScheduler
+    private sealed class CapturingKeyboardScheduler : IScriptCallbackScheduler
     {
         public List<Action> Callbacks { get; } = [];
 
@@ -265,32 +286,11 @@ public sealed class KeyboardWatchDispatcherTests
         }
     }
 
-    private sealed class ThrowingKeyboardScheduler : IKeyboardWatchCallbackScheduler
+    private sealed class ThrowingKeyboardScheduler : IScriptCallbackScheduler
     {
         public void Schedule(Action callback)
         {
             throw new InvalidOperationException("scheduling failed");
-        }
-    }
-
-    private sealed class CapturingRuntimeLogger : IRuntimeLogger
-    {
-        public List<string> Warnings { get; } = [];
-
-        public List<string> Errors { get; } = [];
-
-        public void Info(string message)
-        {
-        }
-
-        public void Warning(string message)
-        {
-            Warnings.Add(message);
-        }
-
-        public void Error(string message, Exception exception)
-        {
-            Errors.Add($"{message} {exception.Message}");
         }
     }
 }

@@ -49,31 +49,17 @@ public sealed class ApplicationScriptApi
             return true;
         }
 
-        var value = ScriptArgumentReader.GetPropertyValue(options, "includeDetails", "details");
-        if (ScriptArgumentReader.IsMissing(value))
-        {
-            return true;
-        }
-
-        try
-        {
-            return Convert.ToBoolean(value, CultureInfo.InvariantCulture);
-        }
-        catch (InvalidCastException)
-        {
-            throw new ArgumentException("options.includeDetails must be a boolean.", nameof(options));
-        }
-        catch (FormatException)
-        {
-            throw new ArgumentException("options.includeDetails must be a boolean.", nameof(options));
-        }
+        return ScriptArgumentReader.OptionalBoolean(
+            ScriptArgumentReader.GetPropertyValue(options, "includeDetails", "details"),
+            "options.includeDetails",
+            defaultValue: true);
     }
 
     public string LaunchJson(object? target, object? options = null)
     {
         var normalizedTarget = ScriptArgumentReader.RequireNonWhiteSpaceString(target, "target");
-        var parsedOptions = ShellScriptApi.ParseLaunchOptions(options);
-        _logger.Info($"Script hs.application.launch() requested target='{normalizedTarget}'.");
+        var parsedOptions = ShellScriptOptionsParser.ParseLaunchOptions(options);
+        _logger.Info($"Script hs.application.launch() requested target='{LogSanitizer.DescribeTarget(normalizedTarget)}'.");
         var result = _shell.Launch(normalizedTarget, parsedOptions);
         _logger.Info($"Script hs.application.launch() completed success={result.Success} processId={result.ProcessId?.ToString(CultureInfo.InvariantCulture) ?? "null"}.");
         return ScriptJson.Serialize(result);

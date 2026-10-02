@@ -36,84 +36,17 @@ public static class KeyboardKeyRules
         VkRightWin
     ];
 
-    private static readonly IReadOnlyDictionary<uint, string> KeyNames =
-        new Dictionary<uint, string>
-        {
-            [0x08] = "backspace",
-            [0x09] = "tab",
-            [0x0D] = "enter",
-            [0x10] = "shift",
-            [0x11] = "ctrl",
-            [0x12] = "alt",
-            [0x1B] = "escape",
-            [0x20] = "space",
-            [0x21] = "pageup",
-            [0x22] = "pagedown",
-            [0x23] = "end",
-            [0x24] = "home",
-            [0x25] = "left",
-            [0x26] = "up",
-            [0x27] = "right",
-            [0x28] = "down",
-            [0x2D] = "insert",
-            [0x2E] = "delete",
-            [0x5B] = "win",
-            [0x5C] = "win",
-            [0xA0] = "shift",
-            [0xA1] = "shift",
-            [0xA2] = "ctrl",
-            [0xA3] = "ctrl",
-            [0xA4] = "alt",
-            [0xA5] = "alt",
-            [0xBA] = ";",
-            [0xBB] = "=",
-            [0xBC] = ",",
-            [0xBD] = "-",
-            [0xBE] = ".",
-            [0xBF] = "/",
-            [0xC0] = "`",
-            [0xDB] = "[",
-            [0xDC] = "\\",
-            [0xDD] = "]",
-            [0xDE] = "'"
-        };
-
     private const int DisplayNameTableSize = 256;
 
     // Resolved once per process: GetDisplayName runs on the WH_KEYBOARD_LL path for every
     // keystroke system-wide, so the common VK range must be a plain table lookup.
-    private static readonly string?[] DisplayNameByVk = BuildDisplayNameTable();
+    private static readonly string?[] DisplayNameByVk = KeyNameTable.BuildDisplayNames();
+
+    private static readonly IReadOnlyDictionary<string, uint> VirtualKeysByName = KeyNameTable.BuildNameLookup();
 
     // Cached per HotkeyModifiers combination; GetModifierNames also runs per keystroke/scroll
     // event. Returned arrays are SHARED — callers must treat them as read-only.
     private static readonly string[][] ModifierNamesByFlags = BuildModifierNames();
-
-    private static string?[] BuildDisplayNameTable()
-    {
-        var names = new string?[DisplayNameTableSize];
-
-        for (var letter = 'A'; letter <= 'Z'; letter++)
-        {
-            names[letter] = char.ToLowerInvariant(letter).ToString();
-        }
-
-        for (var digit = '0'; digit <= '9'; digit++)
-        {
-            names[digit] = digit.ToString();
-        }
-
-        for (var functionKey = 0; functionKey <= 0x17; functionKey++)
-        {
-            names[0x70 + functionKey] = $"f{functionKey + 1}";
-        }
-
-        foreach (var (virtualKey, name) in KeyNames)
-        {
-            names[virtualKey] = name;
-        }
-
-        return names;
-    }
 
     private static string[][] BuildModifierNames()
     {
@@ -171,14 +104,33 @@ public static class KeyboardKeyRules
         };
     }
 
+    /// <summary>Every generic, left and right virtual key for the given modifier flags.</summary>
+    public static IReadOnlySet<uint> GetAllModifierVirtualKeys(HotkeyModifiers modifiers)
+    {
+        return AllModifierVirtualKeys
+            .Where(virtualKey => (ModifierForVirtualKey(virtualKey) & modifiers) != 0)
+            .ToHashSet();
+    }
+
+    /// <summary>
+    /// Keys whose scan code carries the E0 prefix (the navigation cluster, right-hand modifiers,
+    /// numpad divide, Apps, PrintScreen and the browser/media keys).
+    /// </summary>
     public static bool IsExtendedVirtualKey(uint virtualKey)
     {
         return virtualKey switch
         {
-            0x21 or 0x22 or 0x23 or 0x24 or 0x25 or 0x26 or 0x27 or 0x28 or 0x2D or 0x2E
-                or VkRightControl or VkRightMenu or VkLeftWin or VkRightWin => true,
+            >= 0x21 and <= 0x28 or 0x2C or 0x2D or 0x2E or 0x5D or 0x6F or 0x90
+                or VkRightControl or VkRightMenu or VkLeftWin or VkRightWin
+                or >= 0xA6 and <= 0xB7 => true,
             _ => false
         };
+    }
+
+    /// <summary>Resolves a key name or alias (case-insensitive) to its virtual key.</summary>
+    public static bool TryParseKeyName(string name, out uint virtualKey)
+    {
+        return VirtualKeysByName.TryGetValue(name, out virtualKey);
     }
 
     public static string GetDisplayName(uint virtualKey)

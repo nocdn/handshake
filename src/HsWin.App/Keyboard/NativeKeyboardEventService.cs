@@ -1,5 +1,6 @@
-using System.ComponentModel;
 using System.Runtime.InteropServices;
+using HsWin.App.Native;
+using HsWin.App.Threading;
 using HsWin.Core.Hotkeys;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
@@ -10,23 +11,21 @@ namespace HsWin.App.Keyboard;
 /// Global keyboard event source backed by WH_KEYBOARD_LL. Callback code must stay small because
 /// Windows runs this hook before posting keyboard input to the target thread.
 /// </summary>
-internal sealed partial class NativeKeyboardEventService : IKeyboardEventService, IDisposable
+internal sealed class NativeKeyboardEventService : IKeyboardEventService, IDisposable
 {
     private const int HcAction = 0;
-    private const int WhKeyboardLl = 13;
     private const int WmKeyDown = 0x0100;
     private const int WmKeyUp = 0x0101;
     private const int WmSysKeyDown = 0x0104;
     private const int WmSysKeyUp = 0x0105;
-    private const int WmQuit = 0x0012;
     private const uint LlkhfInjected = 0x10;
     private const uint LlkhfUp = 0x80;
-    private static readonly TimeSpan HookInstallTimeout = TimeSpan.FromSeconds(5);
 
     private readonly object _gate = new();
     private readonly IRuntimeLogger _logger;
-    private readonly HookProcedure _hookProcedure;
     private readonly KeyboardWatchDispatcher _watchDispatcher;
+    private readonly LowLevelHookThread _hook;
+    private readonly SerializedInputQueue _deferredInput;
     private readonly KeyboardModifierTracker _modifierTracker = new();
     private readonly List<KeyboardWatchSubscription> _subscriptions = [];
 
@@ -40,10 +39,6 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
     private volatile bool _modifiersTracked;
     private volatile HotkeyModifiers _publishedModifiers;
 
-    private IntPtr _hookHandle;
-    private Thread? _hookThread;
-    private uint _hookThreadId;
-    private Exception? _hookInstallException;
     private bool _disposed;
     private long _nextSubscriptionId;
     private Func<KeyboardEventSnapshot, bool>? _hostPriorityHandler;
@@ -53,7 +48,7 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
             logger,
             new KeyboardWatchDispatcher(
                 logger,
-                new SynchronizationContextKeyboardWatchCallbackScheduler(SynchronizationContext.Current)))
+                new SynchronizationContextCallbackScheduler(SynchronizationContext.Current)))
     {
     }
 
@@ -61,7 +56,8 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
     {
         _logger = logger;
         _watchDispatcher = watchDispatcher;
-        _hookProcedure = HookCallback;
+        _hook = new LowLevelHookThread(LowLevelHookThread.KeyboardHookId, "HsWin Keyboard Hook", HookCallback, Win32LowLevelHookPlatform.Instance, logger);
+        _deferredInput = new SerializedInputQueue(logger);
     }
 
     public IDisposable Watch(KeyboardEventWatchOptions options, Func<KeyboardEventSnapshot, bool> callback)
@@ -174,13 +170,16 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
             UninstallHook();
             _disposed = true;
         }
+
+        // Outside the lock: draining runs remap key-ups, whose SendInput re-enters this hook.
+        _deferredInput.Dispose();
     }
 
     private IntPtr HookCallback(int code, IntPtr wParam, IntPtr lParam)
     {
         if (code != HcAction)
         {
-            return User32.CallNextHookEx(_hookHandle, code, wParam, lParam);
+            return _hook.CallNext(code, wParam, lParam);
         }
 
         var message = wParam.ToInt32();
@@ -202,7 +201,7 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
             hostPriorityHandler = _hostPriorityHandler;
             if (hostPriorityHandler is null && _subscriptions.Count == 0)
             {
-                return User32.CallNextHookEx(_hookHandle, code, wParam, lParam);
+                return _hook.CallNext(code, wParam, lParam);
             }
 
             snapshot = CreateSnapshot(hookData.VkCode, isKeyUp, isInjected);
@@ -227,19 +226,18 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
 
         if (subscriptions.Length == 0)
         {
-            return User32.CallNextHookEx(_hookHandle, code, wParam, lParam);
+            return _hook.CallNext(code, wParam, lParam);
         }
 
         bool shouldSwallow;
-        using (KeyboardHookDispatchScope.Enter(_logger, snapshot, hookData.ScanCode, hookData.Flags, message))
+        using (KeyboardHookDispatchScope.Enter(_deferredInput))
         {
             shouldSwallow = _watchDispatcher.Dispatch(snapshot, subscriptions);
-            LogKeyboardEventDispatch(snapshot, shouldSwallow);
         }
 
         return shouldSwallow
             ? new IntPtr(1)
-            : User32.CallNextHookEx(_hookHandle, code, wParam, lParam);
+            : _hook.CallNext(code, wParam, lParam);
     }
 
     private KeyboardEventSnapshot CreateSnapshot(uint virtualKey, bool isKeyUp, bool isInjected)
@@ -279,51 +277,12 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
 
     private void EnsureHookInstalled()
     {
-        if (_hookHandle != IntPtr.Zero)
+        if (_hook.IsInstalled)
         {
             return;
         }
 
-        _hookInstallException = null;
-        using var ready = new ManualResetEventSlim();
-        _hookThread = new Thread(() => HookThreadMain(ready))
-        {
-            IsBackground = true,
-            Name = "HsWin Keyboard Hook"
-        };
-        _hookThread.SetApartmentState(ApartmentState.STA);
-        _hookThread.Start();
-
-        if (!ready.Wait(HookInstallTimeout))
-        {
-            // Best-effort: stop a late-finishing install thread so we do not leave an orphaned hook.
-            if (_hookThreadId != 0)
-            {
-                _ = User32.PostThreadMessage(_hookThreadId, WmQuit, IntPtr.Zero, IntPtr.Zero);
-            }
-
-            if (_hookHandle != IntPtr.Zero)
-            {
-                _ = User32.UnhookWindowsHookEx(_hookHandle);
-                _hookHandle = IntPtr.Zero;
-            }
-
-            _hookThreadId = 0;
-            _hookThread = null;
-            var exception = new TimeoutException($"Timed out after {HookInstallTimeout.TotalMilliseconds:F0}ms while installing WH_KEYBOARD_LL hook.");
-            _logger.Error("Low-level keyboard hook installation timed out.", exception);
-            throw exception;
-        }
-
-        if (_hookInstallException is not null)
-        {
-            throw _hookInstallException;
-        }
-
-        if (_hookHandle == IntPtr.Zero)
-        {
-            throw new InvalidOperationException("WH_KEYBOARD_LL hook thread started without publishing a hook handle.");
-        }
+        _hook.EnsureInstalled();
 
         // Publish tracked modifier state for lock-free IsKeyDown readers while the hook runs.
         _publishedModifiers = _modifierTracker.Pressed;
@@ -335,33 +294,6 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
         _subscriptionSnapshot = [.. _subscriptions];
     }
 
-    private void HookThreadMain(ManualResetEventSlim ready)
-    {
-        _hookThreadId = Kernel32.GetCurrentThreadId();
-
-        var hookHandle = User32.SetWindowsHookEx(WhKeyboardLl, _hookProcedure, Kernel32.GetModuleHandle(null), 0);
-        if (hookHandle == IntPtr.Zero)
-        {
-            var exception = new Win32Exception(Marshal.GetLastPInvokeError(), "Could not install WH_KEYBOARD_LL hook.");
-            _hookInstallException = exception;
-            _logger.Error("Low-level keyboard hook installation failed.", exception);
-            ready.Set();
-            return;
-        }
-
-        _hookHandle = hookHandle;
-        _logger.Info($"WH_KEYBOARD_LL hook installed. Hook=0x{hookHandle.ToInt64():X} threadId={_hookThreadId}.");
-        ready.Set();
-
-        while (User32.GetMessage(out var message, IntPtr.Zero, 0, 0) > 0)
-        {
-            User32.TranslateMessage(ref message);
-            User32.DispatchMessage(ref message);
-        }
-
-        _logger.Info($"Keyboard hook thread exited threadId={_hookThreadId}.");
-    }
-
     private void UninstallHook()
     {
         // Lock-free modifier readers must fall back to GetAsyncKeyState once tracking stops.
@@ -369,34 +301,7 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
         // and clearing them here could pair a stale flag with a cleared value (torn read).
         _modifiersTracked = false;
 
-        var hookHandle = _hookHandle;
-        if (hookHandle == IntPtr.Zero)
-        {
-            return;
-        }
-
-        if (User32.UnhookWindowsHookEx(hookHandle))
-        {
-            _logger.Info("WH_KEYBOARD_LL hook uninstalled.");
-        }
-        else
-        {
-            var exception = new Win32Exception(Marshal.GetLastPInvokeError(), "Could not uninstall WH_KEYBOARD_LL hook.");
-            _logger.Error("Low-level keyboard hook uninstall failed.", exception);
-        }
-
-        _hookHandle = IntPtr.Zero;
-        if (_hookThreadId != 0)
-        {
-            if (!User32.PostThreadMessage(_hookThreadId, WmQuit, IntPtr.Zero, IntPtr.Zero))
-            {
-                var exception = new Win32Exception(Marshal.GetLastPInvokeError(), "Could not stop the keyboard hook thread.");
-                _logger.Error("Keyboard hook thread stop signal failed.", exception);
-            }
-        }
-
-        _hookThreadId = 0;
-        _hookThread = null;
+        _hook.Uninstall();
     }
 
     private static bool IsKeyUpMessage(int message, uint flags)
@@ -407,22 +312,7 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
     private static bool IsInjectedEvent(KeyboardHookStruct hookData)
     {
         return (hookData.Flags & LlkhfInjected) != 0
-            || hookData.ExtraInfo == HsWin.App.Input.KeyboardInputSender.InjectedExtraInfo;
-    }
-
-    private void LogKeyboardEventDispatch(KeyboardEventSnapshot snapshot, bool shouldSwallow)
-    {
-        if (!shouldSwallow)
-        {
-            return;
-        }
-
-        // Swallowed events are actionable diagnostics (something consumed the key); everything
-        // else fires at typing rate and is deliberately not logged from the hook path.
-        _logger.Info(
-            $"Keyboard event swallowed key='{snapshot.Key}' type='{snapshot.Type}' vk=0x{snapshot.KeyCode:X2} " +
-            $"injected={snapshot.IsInjected} extended={snapshot.IsExtended} " +
-            $"deferredActions={KeyboardHookDispatchScope.CurrentDeferredActionCount}.");
+            || hookData.ExtraInfo == NativeInputSender.InjectedExtraInfo;
     }
 
     private static string FormatKeyFilter(IReadOnlySet<uint>? keyFilter)
@@ -444,67 +334,5 @@ internal sealed partial class NativeKeyboardEventService : IKeyboardEventService
         public uint Time;
 
         public UIntPtr ExtraInfo;
-    }
-
-    private delegate IntPtr HookProcedure(int code, IntPtr wParam, IntPtr lParam);
-
-    private static partial class User32
-    {
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern IntPtr SetWindowsHookEx(int idHook, HookProcedure hookProcedure, IntPtr moduleHandle, uint threadId);
-
-        [LibraryImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static partial bool UnhookWindowsHookEx(IntPtr hookHandle);
-
-        [LibraryImport("user32.dll")]
-        public static partial IntPtr CallNextHookEx(IntPtr hookHandle, int code, IntPtr wParam, IntPtr lParam);
-
-        [LibraryImport("user32.dll", EntryPoint = "GetMessageW", SetLastError = true)]
-        public static partial int GetMessage(out NativeMessage message, IntPtr windowHandle, uint messageFilterMin, uint messageFilterMax);
-
-        [LibraryImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static partial bool TranslateMessage(ref NativeMessage message);
-
-        [LibraryImport("user32.dll", EntryPoint = "DispatchMessageW")]
-        public static partial IntPtr DispatchMessage(ref NativeMessage message);
-
-        [LibraryImport("user32.dll", EntryPoint = "PostThreadMessageW", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static partial bool PostThreadMessage(uint threadId, int message, IntPtr wParam, IntPtr lParam);
-    }
-
-    private static partial class Kernel32
-    {
-        [LibraryImport("kernel32.dll", EntryPoint = "GetModuleHandleW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
-        public static partial IntPtr GetModuleHandle(string? moduleName);
-
-        [LibraryImport("kernel32.dll")]
-        public static partial uint GetCurrentThreadId();
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct NativeMessage
-    {
-        public IntPtr Hwnd;
-
-        public uint Message;
-
-        public IntPtr WParam;
-
-        public IntPtr LParam;
-
-        public uint Time;
-
-        public NativePoint Point;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct NativePoint
-    {
-        public int X;
-
-        public int Y;
     }
 }

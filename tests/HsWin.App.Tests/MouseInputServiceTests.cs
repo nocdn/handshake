@@ -1,4 +1,6 @@
 using HsWin.App.Input;
+using HsWin.App.Threading;
+using HsWin.Core.Input;
 using HsWin.Core.Logging;
 using HsWin.Core.Mouse;
 
@@ -42,19 +44,19 @@ public sealed class MouseInputServiceTests
 
         using var repeat = service.Repeat(
             MouseButton.Right,
-            new MouseRepeatOptions(10, MouseInputMethod.WindowMessage));
+            new MouseRepeatOptions(10, InputMethod.WindowMessage));
 
         Assert.True(sender.WaitForClickCount(2, TimeSpan.FromSeconds(2)));
         repeat.Dispose();
 
-        Assert.All(sender.InputMethods, method => Assert.Equal(MouseInputMethod.WindowMessage, method));
+        Assert.All(sender.InputMethods, method => Assert.Equal(InputMethod.WindowMessage, method));
     }
 
     [Fact]
     public void SetIntervalMsChangesRateWithoutReplacingTheSession()
     {
         var sender = new CapturingMouseInputSender();
-        var timers = new CapturingMouseRepeatTimerFactory();
+        var timers = new ManualPreciseTimerFactory();
         var service = new MouseInputService(NullRuntimeLogger.Instance, sender, timers);
 
         using var repeat = service.Repeat(MouseButton.Right, new MouseRepeatOptions(20));
@@ -95,9 +97,9 @@ public sealed class MouseInputServiceTests
 
         public List<MouseButton> Clicks { get; } = [];
 
-        public List<MouseInputMethod> InputMethods { get; } = [];
+        public List<InputMethod> InputMethods { get; } = [];
 
-        public void SendClick(MouseButton button, MouseInputMethod inputMethod, IRuntimeLogger? logger = null)
+        public void SendClick(MouseButton button, InputMethod inputMethod, IRuntimeLogger? logger = null)
         {
             lock (_gate)
             {
@@ -126,38 +128,6 @@ public sealed class MouseInputServiceTests
             }
 
             return false;
-        }
-    }
-
-    private sealed class CapturingMouseRepeatTimerFactory : IMouseRepeatTimerFactory
-    {
-        public CapturingMouseRepeatTimer Timer { get; } = new();
-
-        public IMouseRepeatTimer Create(Action tick)
-        {
-            Timer.Tick = tick;
-            return Timer;
-        }
-    }
-
-    private sealed class CapturingMouseRepeatTimer : IMouseRepeatTimer
-    {
-        public Action? Tick { get; set; }
-
-        public (int DueTimeMs, int PeriodMs) LastSchedule { get; private set; }
-
-        public void Change(int dueTimeMs, int periodMs)
-        {
-            LastSchedule = (dueTimeMs, periodMs);
-        }
-
-        public void Fire()
-        {
-            Assert.IsType<Action>(Tick)();
-        }
-
-        public void Dispose()
-        {
         }
     }
 }

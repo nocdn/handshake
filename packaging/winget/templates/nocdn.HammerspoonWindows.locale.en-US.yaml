@@ -3,7 +3,7 @@
 PackageIdentifier: nocdn.HammerspoonWindows
 PackageVersion: '{{PACKAGE_VERSION}}'
 PackageLocale: en-US
-Publisher: Hammerspoon
+Publisher: nocdn
 PublisherUrl: https://github.com/nocdn
 PublisherSupportUrl: https://github.com/nocdn/hammerspoon-win/issues
 PrivacyUrl: https://github.com/nocdn/hammerspoon-win/blob/main/PRIVACY.md

@@ -17,6 +17,35 @@ public sealed class LogSanitizerTests
         Assert.Contains("sha256=", description);
     }
 
+    [Theory]
+    [InlineData(@"C:\Users\alice\Documents\tax-return-2025.pdf", "tax-return-2025.pdf")]
+    [InlineData(@"C:\Program Files\App\app.exe", "app.exe")]
+    [InlineData("notepad", "notepad")]
+    [InlineData("calc.exe", "calc.exe")]
+    public void DescribeTargetKeepsOnlyTheFileNameOfAPath(string target, string expected)
+    {
+        Assert.Equal(expected, LogSanitizer.DescribeTarget(target));
+    }
+
+    [Fact]
+    public void DescribeTargetRedactsUrlQueryValues()
+    {
+        var description = LogSanitizer.DescribeTarget("https://example.test/reset?token=secret-value&user=alice");
+
+        Assert.DoesNotContain("secret-value", description);
+        Assert.DoesNotContain("alice", description);
+        Assert.Equal("https://example.test/reset?keys=token,user", description);
+    }
+
+    [Fact]
+    public void DescribeTargetNeverRevealsAFolderName()
+    {
+        var description = LogSanitizer.DescribeTarget(@"C:\Users\bob\");
+
+        Assert.DoesNotContain("bob", description);
+        Assert.Equal("target length=13", description);
+    }
+
     [Fact]
     public void DescribeCommandProducesStableFingerprintForSameInput()
     {

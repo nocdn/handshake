@@ -37,7 +37,10 @@ internal interface IToastView
 
     void UpdateRequest(AlertRequest request);
 
-    void BeginEnterAnimation();
+    /// <summary>Optional hook; views without an enter animation inherit this no-op.</summary>
+    void BeginEnterAnimation()
+    {
+    }
 
     void BeginExitAnimation(Action onComplete);
 
@@ -128,10 +131,6 @@ internal sealed class ToastWindow : Window, IToastView
     }
 
     public Visual PlacementVisual => this;
-
-    public void BeginEnterAnimation()
-    {
-    }
 
     public void BeginExitAnimation(Action onComplete) => _exitAnimator.Begin(onComplete);
 

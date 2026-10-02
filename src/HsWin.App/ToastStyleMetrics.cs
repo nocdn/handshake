@@ -9,8 +9,6 @@ internal static class ToastStyleMetrics
     public const double TextFontSize = 14;
     public const double TextMaxWidth = 520;
     public const double DotSize = 6;
-    public const double DotTextGap = 10;
-    public const double DotStateLeftPadding = 17;
     public const double DotStateRightPadding = 18;
     public const double DotTranslateY = -0.75;
     public const double IconSlotSize = 14;

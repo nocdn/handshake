@@ -1,6 +1,7 @@
 using HsWin.App.Input;
 using HsWin.App.Keyboard;
 using HsWin.Core.Hotkeys;
+using HsWin.Core.Input;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
 using System.Runtime.ExceptionServices;
@@ -12,70 +13,105 @@ public sealed class KeyboardInputServiceTests
     [Fact]
     public void TapOutsideKeyboardHookDispatchSendsImmediately()
     {
-        var logger = new CapturingRuntimeLogger();
         var sender = new CapturingKeyboardInputSender();
-        var service = new KeyboardInputService(logger, sender);
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
 
         service.Tap(0x23, KeyboardTapOptions.Default);
 
-        var action = Assert.Single(sender.Actions);
-        Assert.Equal("tap:0x23:sendInput", action);
-        Assert.DoesNotContain(logger.Infos, info => info.Contains("deferred", StringComparison.Ordinal));
+        Assert.Equal("tap:0x23:sendInput", Assert.Single(sender.Actions));
     }
 
     [Fact]
     public void TapInsideKeyboardHookDispatchDefersUntilHookReturns()
     {
-        var logger = new CapturingRuntimeLogger();
         var sender = new CapturingKeyboardInputSender();
-        var service = new KeyboardInputService(logger, sender);
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+        using var queue = new SerializedInputQueue(NullRuntimeLogger.Instance);
 
-        using (var scope = KeyboardHookDispatchScope.Enter(
-                   logger,
-                   new KeyboardEventSnapshot("keydown", 0x21, "pageup", [], 0, true, false, false, false, false),
-                   scanCode: 0x49,
-                   flags: 0x10,
-                   message: 0x0100))
+        using (KeyboardHookDispatchScope.Enter(queue))
         {
             service.Tap(0x23, KeyboardTapOptions.Default);
 
             Assert.Empty(sender.Actions);
-            Assert.Contains(
-                logger.Infos,
-                info => info.Contains("Keyboard remap input deferred", StringComparison.Ordinal)
-                    && info.Contains("tap key='end' vk=0x23", StringComparison.Ordinal));
         }
 
         Assert.True(sender.WaitForAction(TimeSpan.FromSeconds(2)));
-        var action = Assert.Single(sender.Actions);
-        Assert.Equal("tap:0x23:sendInput", action);
-        Assert.Contains(logger.Infos, info => info.Contains("deferred input executing", StringComparison.Ordinal));
-        Assert.Contains(logger.Infos, info => info.Contains("deferred input completed", StringComparison.Ordinal));
+        Assert.Equal("tap:0x23:sendInput", Assert.Single(sender.Actions));
+    }
+
+    [Fact]
+    public void DeferredInputNeverLogsWhatWasTyped()
+    {
+        var logger = new CapturingRuntimeLogger();
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(logger, sender);
+        using var queue = new SerializedInputQueue(logger);
+
+        using (KeyboardHookDispatchScope.Enter(queue))
+        {
+            service.Tap(0x41, KeyboardTapOptions.Default);
+        }
+
+        Assert.True(sender.WaitForAction(TimeSpan.FromSeconds(2)));
+        Assert.Empty(logger.All);
+    }
+
+    [Fact]
+    public void DeferredInputFromSeparateKeystrokesRunsInKeystrokeOrder()
+    {
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+        using var queue = new SerializedInputQueue(NullRuntimeLogger.Instance);
+
+        for (uint key = 0x30; key < 0x30 + 50; key++)
+        {
+            using (KeyboardHookDispatchScope.Enter(queue))
+            {
+                service.KeyDown(key);
+                service.KeyUp(key);
+            }
+        }
+
+        Assert.True(sender.WaitForActionCount(100, TimeSpan.FromSeconds(5)));
+        var expected = Enumerable.Range(0x30, 50)
+            .SelectMany(key => new[] { $"down:0x{key:X2}:sendInput", $"up:0x{key:X2}:sendInput" });
+        Assert.Equal(expected, sender.Actions);
+    }
+
+    [Fact]
+    public void ReleaseHeldKeysInsideKeyboardHookDispatchIsDeferredToo()
+    {
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+        using var queue = new SerializedInputQueue(NullRuntimeLogger.Instance);
+        service.KeyDown(0x57);
+        var sentBefore = sender.Actions.Count;
+
+        using (KeyboardHookDispatchScope.Enter(queue))
+        {
+            service.ReleaseHeldKeys();
+
+            Assert.Equal(sentBefore, sender.Actions.Count);
+        }
+
+        Assert.True(sender.WaitForActionCount(sentBefore + 1, TimeSpan.FromSeconds(2)));
+        Assert.Equal("up:0x57:sendInput", sender.Actions[^1]);
     }
 
     [Fact]
     public void TapAfterKeyboardHookDispatchDisposedSendsImmediately()
     {
-        var logger = new CapturingRuntimeLogger();
         var sender = new CapturingKeyboardInputSender();
-        var service = new KeyboardInputService(logger, sender);
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+        using var queue = new SerializedInputQueue(NullRuntimeLogger.Instance);
 
-        using (KeyboardHookDispatchScope.Enter(
-                   logger,
-                   new KeyboardEventSnapshot("keydown", 0x08, "backspace", [], 0, true, false, false, false, false),
-                   scanCode: 0x0E,
-                   flags: 0,
-                   message: 0x0100))
+        using (KeyboardHookDispatchScope.Enter(queue))
         {
         }
 
         service.Tap(0x24, KeyboardTapOptions.Default);
 
-        var action = Assert.Single(sender.Actions);
-        Assert.Equal("tap:0x24:sendInput", action);
-        Assert.DoesNotContain(
-            logger.Infos,
-            info => info.Contains("Keyboard remap input deferred", StringComparison.Ordinal));
+        Assert.Equal("tap:0x24:sendInput", Assert.Single(sender.Actions));
     }
 
     [Fact]
@@ -84,19 +120,14 @@ public sealed class KeyboardInputServiceTests
         // The dispatch scope is local to the hook thread by design: only input sent
         // synchronously by the hook dispatch itself (remaps) is deferred. Script callbacks
         // scheduled onto other threads send inline.
-        var logger = new CapturingRuntimeLogger();
         var sender = new CapturingKeyboardInputSender();
-        var service = new KeyboardInputService(logger, sender);
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+        using var queue = new SerializedInputQueue(NullRuntimeLogger.Instance);
         var scopeThreadId = Environment.CurrentManagedThreadId;
         var workerThreadId = scopeThreadId;
         ExceptionDispatchInfo? workerFailure = null;
 
-        using (KeyboardHookDispatchScope.Enter(
-                   logger,
-                   new KeyboardEventSnapshot("keydown", 0x42, "b", [], 0, true, false, false, false, false),
-                   scanCode: 0x30,
-                   flags: 0,
-                   message: 0x0100))
+        using (KeyboardHookDispatchScope.Enter(queue))
         {
             var worker = new Thread(() =>
             {
@@ -120,12 +151,74 @@ public sealed class KeyboardInputServiceTests
             workerFailure?.Throw();
 
             Assert.NotEqual(scopeThreadId, workerThreadId);
-            var action = Assert.Single(sender.Actions);
-            Assert.Equal("tap:0x24:sendInput", action);
-            Assert.DoesNotContain(
-                logger.Infos,
-                info => info.Contains("Keyboard remap input deferred", StringComparison.Ordinal));
+            Assert.Equal("tap:0x24:sendInput", Assert.Single(sender.Actions));
         }
+    }
+
+    [Fact]
+    public void ReleaseHeldKeysSendsKeyUpForTrackedHolds()
+    {
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+
+        service.KeyDown(0x57);
+        service.KeyDown(0x41);
+        service.ReleaseHeldKeys();
+
+        Assert.Equal(
+            [
+                "down:0x57:sendInput",
+                "down:0x41:sendInput",
+                "up:0x57:sendInput",
+                "up:0x41:sendInput"
+            ],
+            sender.Actions);
+
+        service.ReleaseHeldKeys();
+
+        Assert.Equal(4, sender.Actions.Count);
+    }
+
+    [Fact]
+    public void KeyUpUntracksSoReleaseSkipsIt()
+    {
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+
+        service.KeyDown(0x57);
+        service.KeyUp(0x57);
+        service.ReleaseHeldKeys();
+
+        Assert.Equal(
+            [
+                "down:0x57:sendInput",
+                "up:0x57:sendInput"
+            ],
+            sender.Actions);
+    }
+
+    [Fact]
+    public void TapDoesNotLeaveATrackedHold()
+    {
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+
+        service.Tap(0x57, KeyboardTapOptions.Default);
+        service.ReleaseHeldKeys();
+
+        var action = Assert.Single(sender.Actions);
+        Assert.Equal("tap:0x57:sendInput", action);
+    }
+
+    [Fact]
+    public void ReleaseHeldKeysWhenIdleIsNoOp()
+    {
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+
+        service.ReleaseHeldKeys();
+
+        Assert.Empty(sender.Actions);
     }
 
     [Fact]
@@ -136,7 +229,7 @@ public sealed class KeyboardInputServiceTests
 
         using var repeat = service.Repeat(
             0xA0,
-            new KeyboardRepeatOptions(10, HotkeyModifiers.None, KeyboardInputMethod.WindowMessage));
+            new KeyboardRepeatOptions(10, HotkeyModifiers.None, InputMethod.WindowMessage));
 
         Assert.True(sender.WaitForActionCount(2, TimeSpan.FromSeconds(2)));
         repeat.Dispose();
@@ -157,7 +250,7 @@ public sealed class KeyboardInputServiceTests
             new KeyboardRepeatOptions(
                 IntervalMs: 80,
                 SuppressPhysicalModifiers: HotkeyModifiers.None,
-                InputMethod: KeyboardInputMethod.WindowMessage,
+                InputMethod: InputMethod.WindowMessage,
                 KeyDownMs: 30));
 
         Assert.True(sender.WaitForActionCount(3, TimeSpan.FromSeconds(2)));
@@ -183,7 +276,7 @@ public sealed class KeyboardInputServiceTests
             new KeyboardRepeatOptions(
                 IntervalMs: 120,
                 SuppressPhysicalModifiers: HotkeyModifiers.None,
-                InputMethod: KeyboardInputMethod.SendInput,
+                InputMethod: InputMethod.SendInput,
                 KeyDownMs: 60));
 
         for (var sample = 0; sample < 8; sample++)
@@ -194,6 +287,22 @@ public sealed class KeyboardInputServiceTests
 
         Assert.Contains(true, sampledStates);
         Assert.Contains(false, sampledStates);
+    }
+
+    [Fact]
+    public void RepeatTapsWithTheRequestedModifiersHeld()
+    {
+        var sender = new CapturingKeyboardInputSender();
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+
+        using var repeat = service.Repeat(
+            0x41,
+            new KeyboardRepeatOptions(IntervalMs: 10, SuppressPhysicalModifiers: HotkeyModifiers.None, Modifiers: HotkeyModifiers.Control));
+
+        Assert.True(sender.WaitForActionCount(1, TimeSpan.FromSeconds(2)));
+        repeat.Dispose();
+
+        Assert.Equal([KeyboardKeyRules.VkControl], sender.TapModifiers[0]);
     }
 
     [Fact]
@@ -268,6 +377,18 @@ public sealed class KeyboardInputServiceTests
         private readonly object _gate = new();
         private readonly List<string> _actions = [];
         private readonly HashSet<uint> _downKeys = [];
+        private readonly List<IReadOnlyList<uint>> _tapModifiers = [];
+
+        public IReadOnlyList<IReadOnlyList<uint>> TapModifiers
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return [.. _tapModifiers];
+                }
+            }
+        }
 
         public IReadOnlyList<string> Actions
         {
@@ -282,22 +403,22 @@ public sealed class KeyboardInputServiceTests
 
         public void SendKeyDown(
             uint virtualKey,
-            KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+            InputMethod inputMethod = InputMethod.SendInput,
             IRuntimeLogger? logger = null)
         {
             Add(
-                $"down:0x{virtualKey:X2}:{KeyboardInputMethodParser.GetDisplayName(inputMethod)}",
+                $"down:0x{virtualKey:X2}:{InputMethodParser.GetDisplayName(inputMethod)}",
                 virtualKey,
                 isDown: true);
         }
 
         public void SendKeyUp(
             uint virtualKey,
-            KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+            InputMethod inputMethod = InputMethod.SendInput,
             IRuntimeLogger? logger = null)
         {
             Add(
-                $"up:0x{virtualKey:X2}:{KeyboardInputMethodParser.GetDisplayName(inputMethod)}",
+                $"up:0x{virtualKey:X2}:{InputMethodParser.GetDisplayName(inputMethod)}",
                 virtualKey,
                 isDown: false);
         }
@@ -306,10 +427,15 @@ public sealed class KeyboardInputServiceTests
             uint virtualKey,
             IReadOnlyList<uint>? suppressedModifierVirtualKeys = null,
             IReadOnlyList<uint>? modifierVirtualKeys = null,
-            KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+            InputMethod inputMethod = InputMethod.SendInput,
             IRuntimeLogger? logger = null)
         {
-            Add($"tap:0x{virtualKey:X2}:{KeyboardInputMethodParser.GetDisplayName(inputMethod)}");
+            lock (_gate)
+            {
+                _tapModifiers.Add(modifierVirtualKeys ?? []);
+            }
+
+            Add($"tap:0x{virtualKey:X2}:{InputMethodParser.GetDisplayName(inputMethod)}");
         }
 
         public bool WaitForAction(TimeSpan timeout)
@@ -405,52 +531,31 @@ public sealed class KeyboardInputServiceTests
         }
     }
 
-    private sealed class CapturingRuntimeLogger : IRuntimeLogger
-    {
-        public List<string> Infos { get; } = [];
-
-        public List<string> Warnings { get; } = [];
-
-        public List<string> Errors { get; } = [];
-
-        public void Info(string message)
-        {
-            Infos.Add(message);
-        }
-
-        public void Warning(string message)
-        {
-            Warnings.Add(message);
-        }
-
-        public void Error(string message, Exception exception)
-        {
-            Errors.Add($"{message} {exception.Message}");
-        }
-    }
-
     [Fact]
     public void NestedKeyboardHookDispatchScopesRestoreCorrectly()
     {
-        var logger = new CapturingRuntimeLogger();
         var sender = new CapturingKeyboardInputSender();
-        var service = new KeyboardInputService(logger, sender);
-        var outerSnapshot = new KeyboardEventSnapshot("keydown", 0x42, "b", [], 0, true, false, false, false, false);
-        var innerSnapshot = new KeyboardEventSnapshot("keydown", 0x43, "c", [], 0, true, false, false, false, false);
+        var service = new KeyboardInputService(NullRuntimeLogger.Instance, sender);
+        using var queue = new SerializedInputQueue(NullRuntimeLogger.Instance);
 
-        using (KeyboardHookDispatchScope.Enter(logger, outerSnapshot, 0x30, 0, 0x0100))
+        using (KeyboardHookDispatchScope.Enter(queue))
         {
-            using (KeyboardHookDispatchScope.Enter(logger, innerSnapshot, 0x2E, 0, 0x0100))
+            using (KeyboardHookDispatchScope.Enter(queue))
             {
                 service.Tap(0x23, KeyboardTapOptions.Default);
                 Assert.Empty(sender.Actions);
             }
 
+            // Disposing the inner scope hands its deferred tap to the worker, which may run it at
+            // any moment; wait for exactly that one so the next assertion is deterministic.
+            Assert.True(sender.WaitForActionCount(1, TimeSpan.FromSeconds(2)));
+
             // Inner scope disposed: the outer scope must still capture deferrals.
             service.Tap(0x24, KeyboardTapOptions.Default);
-            Assert.Empty(sender.Actions);
+            Assert.Equal("tap:0x23:sendInput", Assert.Single(sender.Actions));
         }
 
         Assert.True(sender.WaitForActionCount(2, TimeSpan.FromSeconds(2)));
+        Assert.Equal(["tap:0x23:sendInput", "tap:0x24:sendInput"], sender.Actions);
     }
 }

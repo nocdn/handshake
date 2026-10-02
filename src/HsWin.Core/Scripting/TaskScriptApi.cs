@@ -28,99 +28,66 @@ public sealed class TaskScriptApi
         _trackResource = trackResource;
     }
 
+    /// <summary>
+    /// Runs a command on a background thread and reports its result. Stopping the handle (or
+    /// reloading the config) kills the command's process tree and suppresses the callback.
+    /// </summary>
     public ScriptResourceHandle Run(object? command, object? options, object? callback)
     {
         var normalizedCommand = ScriptArgumentReader.RequireNonWhiteSpaceString(command, "command");
-        var parsedOptions = ShellScriptApi.ParseExecutionOptions(options);
+        var parsedOptions = ShellScriptOptionsParser.ParseExecutionOptions(options);
         if (callback is not ScriptObject scriptFunction)
         {
             throw new ArgumentException("Task callback must be a JavaScript function.", nameof(callback));
         }
 
-        var task = new BackgroundCommandTask(
-            normalizedCommand,
-            parsedOptions,
-            scriptFunction,
-            _shell,
-            _logger,
-            _callbackScheduler,
-            _callbacks);
-        var handle = new ScriptResourceHandle(task);
+        var relay = new ScriptCallbackRelay(scriptFunction, _callbackScheduler, _callbacks);
+        var cancellation = new CancellationTokenSource();
+        var handle = relay.Attach(new Support.DisposableAction(() => CancelQuietly(cancellation)));
         _trackResource(handle);
-        task.Start();
         _logger.Info($"Script hs.task.run() started command={LogSanitizer.DescribeCommand(normalizedCommand)} timeoutMs={parsedOptions.TimeoutMs}.");
+        _ = Task.Run(() => RunCommand(normalizedCommand, parsedOptions, relay, cancellation));
         return handle;
     }
 
-    private sealed class BackgroundCommandTask : IDisposable
+    private static void CancelQuietly(CancellationTokenSource cancellation)
     {
-        private readonly string _command;
-        private readonly ShellExecutionOptions _options;
-        private readonly ScriptObject _callback;
-        private readonly IShellService _shell;
-        private readonly IRuntimeLogger _logger;
-        private readonly IScriptCallbackScheduler _callbackScheduler;
-        private readonly ScriptCallbackInvoker _callbacks;
-        private int _disposed;
-
-        public BackgroundCommandTask(
-            string command,
-            ShellExecutionOptions options,
-            ScriptObject callback,
-            IShellService shell,
-            IRuntimeLogger logger,
-            IScriptCallbackScheduler callbackScheduler,
-            ScriptCallbackInvoker callbacks)
+        try
         {
-            _command = command;
-            _options = options;
-            _callback = callback;
-            _shell = shell;
-            _logger = logger;
-            _callbackScheduler = callbackScheduler;
-            _callbacks = callbacks;
+            cancellation.Cancel();
         }
-
-        public void Start()
+        catch (ObjectDisposedException)
         {
-            _ = System.Threading.Tasks.Task.Run(RunCommand);
+            // The command already finished and released its token.
         }
+    }
 
-        public void Dispose()
-        {
-            Interlocked.Exchange(ref _disposed, 1);
-        }
-
-        private void RunCommand()
+    private void RunCommand(string command, ShellExecutionOptions options, ScriptCallbackRelay relay, CancellationTokenSource cancellation)
+    {
+        try
         {
             var startedAt = Stopwatch.GetTimestamp();
-            var result = _shell.Execute(_command, _options);
+            var result = _shell.Execute(command, options, cancellation.Token);
             _logger.Info(
                 $"Script hs.task.run() command completed success={result.Success} exitCode={result.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "null"} " +
-                $"timedOut={result.TimedOut} elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
+                $"timedOut={result.TimedOut} cancelled={result.Cancelled} elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
 
-            if (IsDisposed())
+            if (result.Cancelled || relay.IsCancelled)
             {
-                _logger.Info("Script hs.task.run() callback skipped because task was disposed.");
+                relay.Complete();
                 return;
             }
 
-            var resultJson = ScriptJson.Serialize(result);
-            _callbackScheduler.Schedule(() =>
-            {
-                if (IsDisposed())
-                {
-                    _logger.Info("Script hs.task.run() scheduled callback skipped because task was disposed.");
-                    return;
-                }
-
-                _callbacks.InvokeScriptCallback(_callback, resultJson);
-            });
+            relay.PostFinal(ScriptJson.Serialize(result));
         }
-
-        private bool IsDisposed()
+        catch (Exception exception)
         {
-            return Volatile.Read(ref _disposed) != 0;
+            _logger.Error("Script hs.task.run() command failed unexpectedly.", exception);
+            relay.Complete();
+        }
+        finally
+        {
+            cancellation.Dispose();
         }
     }
 }

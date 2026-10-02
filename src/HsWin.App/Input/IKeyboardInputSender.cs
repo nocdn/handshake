@@ -1,4 +1,4 @@
-using HsWin.Core.Keyboard;
+using HsWin.Core.Input;
 using HsWin.Core.Logging;
 
 namespace HsWin.App.Input;
@@ -7,19 +7,19 @@ internal interface IKeyboardInputSender
 {
     void SendKeyDown(
         uint virtualKey,
-        KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+        InputMethod inputMethod = InputMethod.SendInput,
         IRuntimeLogger? logger = null);
 
     void SendKeyUp(
         uint virtualKey,
-        KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+        InputMethod inputMethod = InputMethod.SendInput,
         IRuntimeLogger? logger = null);
 
     void SendTap(
         uint virtualKey,
         IReadOnlyList<uint>? suppressedModifierVirtualKeys = null,
         IReadOnlyList<uint>? modifierVirtualKeys = null,
-        KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+        InputMethod inputMethod = InputMethod.SendInput,
         IRuntimeLogger? logger = null);
 }
 
@@ -33,10 +33,10 @@ internal sealed class NativeKeyboardInputSender : IKeyboardInputSender
 
     public void SendKeyDown(
         uint virtualKey,
-        KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+        InputMethod inputMethod = InputMethod.SendInput,
         IRuntimeLogger? logger = null)
     {
-        if (inputMethod == KeyboardInputMethod.WindowMessage)
+        if (inputMethod == InputMethod.WindowMessage)
         {
             WindowMessageKeyboardInputSender.SendKeyDown(virtualKey, logger);
             return;
@@ -47,10 +47,10 @@ internal sealed class NativeKeyboardInputSender : IKeyboardInputSender
 
     public void SendKeyUp(
         uint virtualKey,
-        KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+        InputMethod inputMethod = InputMethod.SendInput,
         IRuntimeLogger? logger = null)
     {
-        if (inputMethod == KeyboardInputMethod.WindowMessage)
+        if (inputMethod == InputMethod.WindowMessage)
         {
             WindowMessageKeyboardInputSender.SendKeyUp(virtualKey, logger);
             return;
@@ -63,10 +63,10 @@ internal sealed class NativeKeyboardInputSender : IKeyboardInputSender
         uint virtualKey,
         IReadOnlyList<uint>? suppressedModifierVirtualKeys = null,
         IReadOnlyList<uint>? modifierVirtualKeys = null,
-        KeyboardInputMethod inputMethod = KeyboardInputMethod.SendInput,
+        InputMethod inputMethod = InputMethod.SendInput,
         IRuntimeLogger? logger = null)
     {
-        if (inputMethod == KeyboardInputMethod.WindowMessage)
+        if (inputMethod == InputMethod.WindowMessage)
         {
             WindowMessageKeyboardInputSender.SendTap(
                 virtualKey,

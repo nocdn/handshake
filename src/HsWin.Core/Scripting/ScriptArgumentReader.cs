@@ -45,13 +45,26 @@ public static class ScriptArgumentReader
 
         if (value is ScriptObject scriptObject)
         {
-            var propertyNames = scriptObject.PropertyNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // Exact-case aliases are the common case and need no property enumeration.
             foreach (var name in names)
             {
-                var actualName = propertyNames.FirstOrDefault(propertyName => string.Equals(propertyName, name, StringComparison.OrdinalIgnoreCase));
-                if (actualName is not null)
+                var exact = scriptObject.GetProperty(name);
+                if (!IsMissing(exact))
                 {
-                    return scriptObject.GetProperty(actualName);
+                    return exact;
+                }
+            }
+
+            // Fall back to one enumeration for case-insensitive spellings ("TimeoutMs").
+            var propertyNames = scriptObject.PropertyNames.ToArray();
+            foreach (var name in names)
+            {
+                foreach (var propertyName in propertyNames)
+                {
+                    if (string.Equals(propertyName, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return scriptObject.GetProperty(propertyName);
+                    }
                 }
             }
 
@@ -212,30 +225,72 @@ public static class ScriptArgumentReader
             throw new ArgumentException($"{argumentName} is required.", argumentName);
         }
 
-        return Convert.ToBoolean(value, CultureInfo.InvariantCulture);
+        return value switch
+        {
+            bool boolean => boolean,
+            string text when bool.TryParse(text.Trim(), out var parsed) => parsed,
+            _ => throw new ArgumentException($"{argumentName} must be true or false.", argumentName)
+        };
     }
 
+    public static bool OptionalBoolean(object? value, string argumentName, bool defaultValue)
+    {
+        return IsMissing(value) ? defaultValue : RequireBoolean(value, argumentName);
+    }
+
+    /// <summary>
+    /// Reads a whole number. JavaScript numbers arrive as doubles; fractions round half away from
+    /// zero (1.5 -> 2), and NaN, infinities and out-of-range values are rejected with the argument name.
+    /// </summary>
     public static int RequireInt32(object? value, string argumentName, string expectedDescription)
     {
-        if (IsMissing(value))
+        var number = RequireDouble(value, argumentName, expectedDescription);
+        var rounded = Math.Round(number, MidpointRounding.AwayFromZero);
+        if (rounded is < int.MinValue or > int.MaxValue)
         {
-            throw new ArgumentException($"{argumentName} is required.", argumentName);
+            throw new ArgumentOutOfRangeException(argumentName, $"{argumentName} must be {expectedDescription}.");
         }
 
-        try
-        {
-            return Convert.ToInt32(value, CultureInfo.InvariantCulture);
-        }
-        catch (FormatException exception)
-        {
-            throw new ArgumentException($"{argumentName} must be {expectedDescription}.", argumentName, exception);
-        }
-        catch (InvalidCastException exception)
-        {
-            throw new ArgumentException($"{argumentName} must be {expectedDescription}.", argumentName, exception);
-        }
+        return (int)rounded;
     }
 
+    public static int RequireInt32InRange(object? value, string argumentName, int minimum, int maximum)
+    {
+        var result = RequireInt32(value, argumentName, "a whole number");
+        if (result < minimum || result > maximum)
+        {
+            throw new ArgumentOutOfRangeException(argumentName, $"{argumentName} must be between {minimum} and {maximum}.");
+        }
+
+        return result;
+    }
+
+    /// <summary>JavaScript truthiness for callback return values (undefined, null, false, 0 and "" are false).</summary>
+    public static bool IsTruthy(object? value)
+    {
+        return value switch
+        {
+            null => false,
+            bool boolean => boolean,
+            string text => text.Length > 0,
+            double number => number != 0 && !double.IsNaN(number),
+            int number => number != 0,
+            _ => !IsMissing(value)
+        };
+    }
+
+    public static int RequirePositiveInt32(object? value, string argumentName)
+    {
+        var result = RequireInt32(value, argumentName, "a positive integer");
+        if (result < 1)
+        {
+            throw new ArgumentOutOfRangeException(argumentName, $"{argumentName} must be at least 1.");
+        }
+
+        return result;
+    }
+
+    /// <summary>Reads a finite number; NaN and infinities are never valid script arguments.</summary>
     public static double RequireDouble(object? value, string argumentName, string expectedDescription)
     {
         if (IsMissing(value))
@@ -243,17 +298,23 @@ public static class ScriptArgumentReader
             throw new ArgumentException($"{argumentName} is required.", argumentName);
         }
 
+        double number;
         try
         {
-            return Convert.ToDouble(value, CultureInfo.InvariantCulture);
+            number = value is string text
+                ? double.Parse(text, NumberStyles.Float, CultureInfo.InvariantCulture)
+                : Convert.ToDouble(value, CultureInfo.InvariantCulture);
         }
-        catch (FormatException exception)
+        catch (Exception exception) when (exception is FormatException or InvalidCastException or OverflowException)
         {
             throw new ArgumentException($"{argumentName} must be {expectedDescription}.", argumentName, exception);
         }
-        catch (InvalidCastException exception)
+
+        if (!double.IsFinite(number))
         {
-            throw new ArgumentException($"{argumentName} must be {expectedDescription}.", argumentName, exception);
+            throw new ArgumentException($"{argumentName} must be {expectedDescription}.", argumentName);
         }
+
+        return number;
     }
 }

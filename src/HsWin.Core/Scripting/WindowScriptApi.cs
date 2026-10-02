@@ -36,7 +36,7 @@ public sealed class WindowScriptApi
             return "null";
         }
 
-        _logger.Info($"Script hs.window.focusedWindow() returned id='{window.Id}' title='{window.Title}'.");
+        _logger.Info($"Script hs.window.focusedWindow() returned id='{window.Id}'.");
         return ScriptJson.Serialize(window);
     }
 
@@ -50,7 +50,7 @@ public sealed class WindowScriptApi
             return "null";
         }
 
-        _logger.Info($"Script hs.window.get('{normalizedId}') returned title='{window.Title}'.");
+        _logger.Info($"Script hs.window.get('{normalizedId}') found the window.");
         return ScriptJson.Serialize(window);
     }
 
@@ -72,13 +72,8 @@ public sealed class WindowScriptApi
             throw new ArgumentException("Window focus callback must be a JavaScript function.", nameof(callback));
         }
 
-        var registration = _windows.WatchFocused(window =>
-        {
-            var windowJson = ScriptJson.Serialize(window);
-            _callbackScheduler.Schedule(() => _callbacks.InvokeScriptCallback(scriptFunction, windowJson));
-        });
-
-        var handle = new ScriptResourceHandle(registration);
+        var relay = new ScriptCallbackRelay(scriptFunction, _callbackScheduler, _callbacks);
+        var handle = relay.Attach(_windows.WatchFocused(window => relay.Post(ScriptJson.Serialize(window))));
         _trackResource(handle);
         _logger.Info("Script hs.window.watchFocused() registered.");
         return handle;
@@ -92,11 +87,13 @@ public sealed class WindowScriptApi
         }
 
         return new WindowMoveOptions(
-            PreserveSize: ConvertOptionalBoolean(
+            PreserveSize: ScriptArgumentReader.OptionalBoolean(
                 ScriptArgumentReader.GetPropertyValue(value, "preserveSize"),
+                "preserveSize",
                 defaultValue: true),
-            UseWorkingArea: ConvertOptionalBoolean(
+            UseWorkingArea: ScriptArgumentReader.OptionalBoolean(
                 ScriptArgumentReader.GetPropertyValue(value, "useWorkingArea", "workingArea"),
+                "useWorkingArea",
                 defaultValue: true));
     }
 
@@ -148,10 +145,4 @@ public sealed class WindowScriptApi
                 "an integer"));
     }
 
-    private static bool ConvertOptionalBoolean(object? value, bool defaultValue)
-    {
-        return ScriptArgumentReader.IsMissing(value)
-            ? defaultValue
-            : Convert.ToBoolean(value, CultureInfo.InvariantCulture);
-    }
 }

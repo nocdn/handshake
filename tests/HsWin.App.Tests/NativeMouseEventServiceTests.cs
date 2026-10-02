@@ -1,3 +1,6 @@
+using HsWin.App.Native;
+using HsWin.App.Threading;
+using HsWin.Core.Scripting;
 using System.Runtime.InteropServices;
 using HsWin.App.Hotkeys;
 using HsWin.App.Mouse;
@@ -94,7 +97,6 @@ public sealed class NativeMouseEventServiceTests
             _ =>
             {
                 seen++;
-                return true;
             });
         using var button = hook.Register(
             Core.Hotkeys.HotkeyDefinition.CreateMouseButton(Core.Hotkeys.HotkeyModifiers.None, Core.Hotkeys.HotkeyMouseButton.XButton1),
@@ -125,7 +127,6 @@ public sealed class NativeMouseEventServiceTests
             _ =>
             {
                 seen++;
-                return false;
             });
 
         Assert.True(platform.InstallCompleted.Wait(TimeSpan.FromSeconds(5)));
@@ -153,7 +154,6 @@ public sealed class NativeMouseEventServiceTests
             _ =>
             {
                 seen++;
-                return false;
             });
 
         Assert.True(platform.InstallCompleted.Wait(TimeSpan.FromSeconds(5)));
@@ -172,11 +172,11 @@ public sealed class NativeMouseEventServiceTests
         var platform = new FakeMouseHookPlatform();
         var dispatcher = new MouseScrollWatchDispatcher(
             NullRuntimeLogger.Instance,
-            new SynchronizationContextMouseScrollWatchCallbackScheduler(null));
+            new SynchronizationContextCallbackScheduler(null));
         using var hook = new NativeMouseHotkeyHook(NullRuntimeLogger.Instance, platform, callbackContext: null, dispatcher);
         var service = new NativeMouseEventService(hook);
 
-        var registration = service.WatchScroll(MouseScrollWatchOptions.Default, _ => false);
+        var registration = service.WatchScroll(MouseScrollWatchOptions.Default, _ => { });
         Assert.True(platform.InstallCompleted.Wait(TimeSpan.FromSeconds(5)));
         registration.Dispose();
 
@@ -184,118 +184,10 @@ public sealed class NativeMouseEventServiceTests
         Assert.Equal(1, platform.QuitPostedCount);
     }
 
-    private sealed class CapturingScheduler : IMouseScrollWatchCallbackScheduler
+    private sealed class CapturingScheduler : IScriptCallbackScheduler
     {
         public List<Action> Callbacks { get; } = [];
 
         public void Schedule(Action callback) => Callbacks.Add(callback);
-    }
-
-    private sealed class FakeMouseHookPlatform : IMouseHookPlatform
-    {
-        private readonly ManualResetEventSlim _quitSignal = new(false);
-        private MouseHookProcedure? _hookProcedure;
-
-        public int SetHookExCount { get; private set; }
-
-        public int UnhookCount { get; private set; }
-
-        public int QuitPostedCount { get; private set; }
-
-        public uint HookThreadId { get; private set; }
-
-        public ManualResetEventSlim InstallCompleted { get; } = new(false);
-
-        public IntPtr SetWindowsHookEx(int idHook, MouseHookProcedure hookProcedure, IntPtr moduleHandle, uint threadId)
-        {
-            SetHookExCount++;
-            _hookProcedure = hookProcedure;
-            InstallCompleted.Set();
-            return new IntPtr(0x4321);
-        }
-
-        public bool UnhookWindowsHookEx(IntPtr hookHandle)
-        {
-            UnhookCount++;
-            return true;
-        }
-
-        public IntPtr CallNextHookEx(IntPtr hookHandle, int code, IntPtr wParam, IntPtr lParam) =>
-            IntPtr.Zero;
-
-        public short GetAsyncKeyState(int virtualKey) => 0;
-
-        public int GetMessage(out NativeMessage message, IntPtr windowHandle, uint messageFilterMin, uint messageFilterMax)
-        {
-            _quitSignal.Wait(TimeSpan.FromSeconds(5));
-            message = default;
-            return 0;
-        }
-
-        public bool TranslateMessage(ref NativeMessage message) => true;
-
-        public IntPtr DispatchMessage(ref NativeMessage message) => IntPtr.Zero;
-
-        public bool PostThreadMessage(uint threadId, int message, IntPtr wParam, IntPtr lParam)
-        {
-            if (message == 0x0012)
-            {
-                QuitPostedCount++;
-                _quitSignal.Set();
-            }
-
-            return true;
-        }
-
-        public uint GetCurrentThreadId()
-        {
-            HookThreadId = (uint)Environment.CurrentManagedThreadId;
-            return HookThreadId;
-        }
-
-        public IntPtr GetModuleHandle(string? moduleName) => new IntPtr(1);
-
-        public IntPtr InvokeWheel(int message, int delta)
-        {
-            if (_hookProcedure is null)
-            {
-                throw new InvalidOperationException("Hook procedure was not installed.");
-            }
-
-            var mouseData = unchecked((uint)((ushort)delta << 16));
-            var hookData = new MouseHookData
-            {
-                X = 5,
-                Y = 6,
-                MouseData = mouseData
-            };
-
-            var pointer = Marshal.AllocHGlobal(Marshal.SizeOf<MouseHookData>());
-            try
-            {
-                Marshal.StructureToPtr(hookData, pointer, false);
-                return _hookProcedure(0, new IntPtr(message), pointer);
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(pointer);
-            }
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MouseHookData
-        {
-            public int X;
-
-            public int Y;
-
-            public uint MouseData;
-
-            public uint Flags;
-
-            public uint Time;
-
-            public UIntPtr ExtraInfo;
-        }
     }
 }

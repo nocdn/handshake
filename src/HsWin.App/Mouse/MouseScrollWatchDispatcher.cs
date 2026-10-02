@@ -1,5 +1,6 @@
 using HsWin.Core.Logging;
 using HsWin.Core.Mouse;
+using HsWin.Core.Scripting;
 
 namespace HsWin.App.Mouse;
 
@@ -7,19 +8,21 @@ namespace HsWin.App.Mouse;
 /// Dispatches mouse-scroll watch subscriptions.
 /// <para>
 /// Critical safety rule: script callbacks never run on the low-level mouse hook thread.
-/// When <see cref="MouseScrollWatchOptions.Blocking"/> / preventDefault is enabled, matching
-/// events are swallowed natively on the hook path and the script callback is scheduled off-hook.
-/// That keeps physical input responsive and prevents global script-lock deadlocks with hotkey release.
+/// When <see cref="MouseScrollWatchOptions.Blocking"/> / preventDefault is enabled, every matching
+/// event is swallowed natively on the hook path and the script callback is scheduled off-hook, so
+/// (unlike keyboard watches) the callback cannot decide per event. High-resolution wheels send
+/// events far faster than a script round trip, and keeping JavaScript off this hook keeps physical
+/// input responsive and avoids script-lock deadlocks with hotkey release.
 /// </para>
 /// </summary>
 internal sealed class MouseScrollWatchDispatcher
 {
     private readonly IRuntimeLogger _logger;
-    private readonly IMouseScrollWatchCallbackScheduler _scheduler;
+    private readonly IScriptCallbackScheduler _scheduler;
 
     public MouseScrollWatchDispatcher(
         IRuntimeLogger logger,
-        IMouseScrollWatchCallbackScheduler scheduler)
+        IScriptCallbackScheduler scheduler)
     {
         _logger = logger;
         _scheduler = scheduler;
@@ -69,79 +72,67 @@ internal sealed class MouseScrollWatchDispatcher
 
     private void ScheduleCallback(MouseScrollWatchSubscription subscription, MouseScrollEventSnapshot snapshot)
     {
+        // High-resolution wheels outrun a script round trip; a slow callback must not let the queue
+        // (and its memory) grow without bound, so events past the backlog limit are dropped.
+        if (!subscription.TryReserveDelivery())
+        {
+            if (subscription.TryMarkBacklogWarned())
+            {
+                _logger.Warning(
+                    $"Mouse scroll watch callback is falling behind id={subscription.Id}; dropping scroll events " +
+                    $"while more than {MouseScrollWatchSubscription.MaxPendingCallbacks} are queued.");
+            }
+
+            return;
+        }
+
         try
         {
             _scheduler.Schedule(() => InvokeCallback(subscription, snapshot));
         }
         catch (Exception exception)
         {
+            subscription.ReleaseDelivery();
             _logger.Error($"Mouse scroll watch callback scheduling failed id={subscription.Id}.", exception);
         }
     }
 
     private void InvokeCallback(MouseScrollWatchSubscription subscription, MouseScrollEventSnapshot snapshot)
     {
-        if (subscription.IsDisposed)
-        {
-            return;
-        }
-
         try
         {
-            // Return value is ignored for preventDefault watchers (host already swallowed natively).
-            // For non-blocking watchers, true is only a usage warning.
-            var requestedSwallow = subscription.Callback(snapshot);
-            if (requestedSwallow && !subscription.Options.Blocking)
+            if (subscription.IsDisposed)
             {
-                _logger.Warning(
-                    $"Mouse scroll watch callback returned true for non-blocking watcher id={subscription.Id}; " +
-                    "use {{ preventDefault: true }} so matching scroll events are swallowed while the watcher is registered.");
+                return;
             }
+
+            subscription.Callback(snapshot);
         }
         catch (Exception exception)
         {
             _logger.Error($"Mouse scroll watch callback failed id={subscription.Id}.", exception);
         }
-    }
-}
-
-internal interface IMouseScrollWatchCallbackScheduler
-{
-    void Schedule(Action callback);
-}
-
-internal sealed class SynchronizationContextMouseScrollWatchCallbackScheduler : IMouseScrollWatchCallbackScheduler
-{
-    private readonly SynchronizationContext? _context;
-
-    public SynchronizationContextMouseScrollWatchCallbackScheduler(SynchronizationContext? context)
-    {
-        _context = context;
-    }
-
-    public void Schedule(Action callback)
-    {
-        ArgumentNullException.ThrowIfNull(callback);
-
-        if (_context is null)
+        finally
         {
-            ThreadPool.QueueUserWorkItem(static state => ((Action)state!).Invoke(), callback);
-            return;
+            subscription.ReleaseDelivery();
         }
-
-        _context.Post(static state => ((Action)state!).Invoke(), callback);
     }
 }
 
 internal sealed class MouseScrollWatchSubscription : IDisposable
 {
+    /// <summary>Callbacks that may be queued for one watch before further scroll events are dropped.</summary>
+    internal const int MaxPendingCallbacks = 256;
+
     private readonly Action<MouseScrollWatchSubscription>? _dispose;
     private int _disposed;
+    private int _pending;
+    private int _backlogWarned;
 
     public MouseScrollWatchSubscription(
         long id,
         MouseScrollWatchOptions options,
-        Func<MouseScrollEventSnapshot, bool> callback,
+        Action<MouseScrollEventSnapshot> callback,
         Action<MouseScrollWatchSubscription>? dispose = null)
     {
         Id = id;
@@ -154,7 +145,7 @@ internal sealed class MouseScrollWatchSubscription : IDisposable
 
     public MouseScrollWatchOptions Options { get; }
 
-    public Func<MouseScrollEventSnapshot, bool> Callback { get; }
+    public Action<MouseScrollEventSnapshot> Callback { get; }
 
     public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
@@ -167,6 +158,23 @@ internal sealed class MouseScrollWatchSubscription : IDisposable
 
         _dispose?.Invoke(this);
     }
+
+    /// <summary>Claims a queue slot; false when the watch already has <see cref="MaxPendingCallbacks"/> queued.</summary>
+    public bool TryReserveDelivery()
+    {
+        if (Interlocked.Increment(ref _pending) <= MaxPendingCallbacks)
+        {
+            return true;
+        }
+
+        Interlocked.Decrement(ref _pending);
+        return false;
+    }
+
+    public void ReleaseDelivery() => Interlocked.Decrement(ref _pending);
+
+    /// <summary>True once per watch, so a sustained backlog logs a single warning.</summary>
+    public bool TryMarkBacklogWarned() => Interlocked.Exchange(ref _backlogWarned, 1) == 0;
 
     public void MarkDisposed()
     {

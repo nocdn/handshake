@@ -4,17 +4,6 @@ namespace HsWin.App.Tests;
 
 public sealed class NativeMediaControllerTests
 {
-    [Fact]
-    public void NativeInputSizeMatchesWin64SendInputLayout()
-    {
-        if (!Environment.Is64BitProcess)
-        {
-            return;
-        }
-
-        Assert.Equal(40, NativeMediaController.NativeInputSize);
-    }
-
     [Theory]
     [InlineData("paused", "playing", "played")]
     [InlineData("stopped", "playing", "played")]
@@ -23,6 +12,9 @@ public sealed class NativeMediaControllerTests
     [InlineData("playing", "unknown", "paused")]
     [InlineData("paused", "unknown", "played")]
     [InlineData("unknown", "unknown", "toggled")]
+    [InlineData("unknown", "playing", "played")]
+    [InlineData("playing", "playing", "paused")]
+    [InlineData("paused", "paused", "played")]
     public void InferPlayPauseActionUsesBeforeAndAfterPlaybackState(
         string statusBefore,
         string statusAfter,

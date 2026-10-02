@@ -2,13 +2,15 @@ namespace HsWin.Core.Scripting;
 
 public sealed class HsScriptHost
 {
-    public HsScriptHost(
+    internal HsScriptHost(
         ScriptRuntimeServices services,
-        Action<IDisposable> trackResource)
+        ScriptResourceScope resources,
+        ScriptCallbackInvoker callbacks)
     {
-        var callbacks = new ScriptCallbackInvoker(services.Alerts, services.Logger);
+        Action<IDisposable> trackResource = resources.Track;
 
         Alerts = new AlertScriptApi(services.Alerts);
+        Magnifier = new MagnifierScriptApi(services.Magnifier, services.KeyboardEvents, services.MouseButtons, trackResource);
         Console = new ConsoleScriptApi(services.Console);
         Clipboard = new ClipboardScriptApi(
             services.Clipboard,
@@ -16,7 +18,7 @@ public sealed class HsScriptHost
             services.CallbackScheduler,
             callbacks,
             trackResource);
-        Shell = new ShellScriptApi(services.Shell, services.Logger);
+        Shell = new ShellScriptApi(services.Shell, services.Console, services.Logger);
         Applications = new ApplicationScriptApi(services.Applications, services.Shell, services.Logger);
         Media = new MediaScriptApi(services.Media, services.Logger);
         Audio = new AudioScriptApi(services.AudioDevices, services.Logger);
@@ -62,6 +64,8 @@ public sealed class HsScriptHost
     }
 
     public AlertScriptApi Alerts { get; }
+
+    public MagnifierScriptApi Magnifier { get; }
 
     public ConsoleScriptApi Console { get; }
 

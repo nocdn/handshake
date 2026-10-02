@@ -12,6 +12,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="HsWin.Core.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <EmbeddedResource Include="Scripting\Resources\bootstrap.js" LogicalName="HsWin.Core.Scripting.Resources.bootstrap.js" />
   </ItemGroup>
 

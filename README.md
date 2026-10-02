@@ -10,7 +10,7 @@ Startup is single-instance. Before the tray app creates hotkeys, keyboard hooks,
 
 Right-click the notification area icon:
 
-- **Open Config** — opens `%APPDATA%\HsWin\config.js` in your default editor (creates the default file first if missing).
+- **Open Config** — opens `%APPDATA%\HsWin\config.js` (creates the default file first if missing). The editor is the command in `HSWIN_EDITOR`, `VISUAL`, or `EDITOR` if set; otherwise the program Windows has registered for `.js` files (script hosts such as Windows Script Host are skipped); otherwise Notepad.
 - **Reload Config** — reloads `config.js` on a background thread (shows reload toasts; same engine reset as startup reload).
 - **Emergency Stop (Ctrl+Alt+Shift+Esc)** — host safety valve: immediately stops mouse/keyboard auto-repeat, interrupts the JavaScript engine, and disposes all config hotkeys, watches, and timers. Automation stays off until you **Reload Config**. The chord is handled on the low-level keyboard hook **before** any config watchers (so it still works when the UI/script thread is wedged); the tray item is a second entry point.
 - **Start at Login** — toggles whether HsWin starts when you sign in to Windows.
@@ -31,6 +31,8 @@ The chord is registered two ways: on the host keyboard hook (ahead of config, fo
 
 Blocking keyboard watches fail open (pass the key through) if the script gate is busy for more than ~30ms, so a slow toast/hotkey callback cannot freeze the keyboard. Prefer key filters and tiny blocking callbacks.
 
+Reload marshaling to the UI thread (script timers, hotkey and clipboard registration) is timeout-bounded: a wedged UI thread fails the reload with an error toast instead of deadlocking the tray, and teardown paths never wait on it. Emergency stop abandons any in-flight reload (a recovered reload tears down its superseded runtime instead of installing a stale config) and waits out the bounded gate hold to finish teardown.
+
 `Ctrl+Alt+Shift+Esc` is reserved for this host feature; avoid binding the same combo in `config.js`.
 
 ## Command line
@@ -44,11 +46,46 @@ hspn config lint                                      # lints %APPDATA%\HsWin\co
 hspn config lint C:\Users\you\AppData\Roaming\HsWin\config.js
 ```
 
-`hspn config reload` sends a command to the running tray app, so reload uses the same live runtime, hotkeys, hooks, logs, and toast path as the tray menu. `hspn config lint` validates a config file offline without touching the running app; by default it lints `%APPDATA%\HsWin\config.js`.
+`hspn config reload` sends a command to the running tray app, so reload uses the same live runtime, hotkeys, hooks, logs, and toast path as the tray menu. `hspn config lint` validates a config file offline without touching the running app; by default it lints `%APPDATA%\HsWin\config.js`. The config's top-level code must finish within 10 seconds when loaded by the app (5 seconds for lint); a config that blocks longer is interrupted and reported as a reload error instead of hanging the app. Long-running work belongs in timers, tasks, or callbacks.
 
 ## Current API
 
 The `hs` global and `console` are frozen. Reloading config rebuilds the JavaScript engine and disposes hotkeys, keyboard watchers, clipboard watchers, timers, and native keyboard repeats from the previous load.
+
+### `hs.magnifier.bindHeld(modifiers, key, options?)` / `hs.magnifier.new(options?)`
+
+Shows a live circular magnifying lens at the center of a screen, with a white ring. Only the lens is zoomed; the rest of the desktop keeps its normal size. Mouse input passes through it, including while hovering over the lens, and it never takes keyboard focus. Press/release has no fade animation.
+
+```js
+// Hold Ctrl+Alt+Z to magnify; releasing Z or either modifier hides it.
+const zoomShortcut = hs.magnifier.bindHeld(["ctrl", "alt"], "z", {
+  zoom: 2, diameter: 720, borderWidth: 3, screen: "foreground", fps: 240
+});
+// zoomShortcut.stop(); // unbind and destroy the lens
+
+// Hold the mouse Forward button instead (preserves existing mouse actions):
+const mouseZoom = hs.magnifier.bindHeld([], "mouse.forward", { zoom: 2, diameter: 720, fps: 240 });
+
+// Control a lens yourself instead:
+const lens = hs.magnifier.new({ zoom: 3, diameter: 400 });
+lens.show();
+lens.setZoom(2);
+console.log(lens.isVisible);
+lens.hide();
+lens.delete();
+```
+
+Lens and `bindHeld` handles support `stop()`, `dispose()`, and `delete()`, which all destroy the lens (and unbind the shortcut); config reload does the same automatically.
+
+Options: `zoom` defaults to `2` (finite number, `1`–`16`); `diameter` defaults to `720` (integer, `80`–`1600` physical pixels, including the ring); `borderWidth` defaults to `3` (integer, `0`–`16` pixels). The lens fits within smaller screens. `screen` defaults to `"foreground"` (the monitor containing the focused app); `"primary"` and `"mouse"` select the primary monitor or the monitor under the pointer. The monitor is selected on each show, and the lens stays centered there while visible.
+
+`fps` defaults to `240` (integer, `30`–`360`) and sets the capture update target. For example, set `fps: 144` or `fps: 360` for a different refresh target. A dedicated high-resolution Windows waitable timer paces frames without busy waiting; the clock sleeps while hidden. Capture work is coalesced to one outstanding frame, so slow captures drop updates instead of building latency or delaying release. Geometry and circular clipping regions are updated only when showing or changing zoom. The visible frame rate depends on Windows composition, monitor refresh, GPU load, and the target app; the update target is not a guarantee of distinct rendered frames.
+
+`bindHeld` uses host-owned input observers, so press/release does not wait for JavaScript callbacks or the WPF UI dispatcher. A keyboard binding ignores injected keys, swallows the trigger key, suppresses autorepeat, and releases when the modifier combination changes. Mouse bindings support `"mouse.back"`, `"mouse.forward"`, and `"mouse.middle"`; they ignore injected clicks, match the modifier combination at button-down, and hide on button-up even if modifiers have changed. Mouse bindings preserve normal button delivery and coexist with existing mouse hotkeys, including browser navigation. Config reload, failed config loads, emergency stop, and shutdown destroy script-owned lenses and bindings automatically.
+
+On Windows 10 version 2004 and newer, the lens prefers Windows Graphics Capture and a DirectComposition swap chain without CPU screen readback. With `screen: "foreground"`, an exact monitor-sized fullscreen app is captured directly; other layouts use monitor capture. Capture frame notifications wake the renderer promptly, newer Windows capture sessions use an unrestricted update interval, and a small frame budget absorbs arrival jitter while limiting presentation to the requested `fps`. Windows capture buffers are drained even when a draw is skipped, and different captured images are retained even when Windows assigns matching timestamps. Only the lens's unzoomed footprint is copied on the GPU; zoom changes resample that cached image instead of retaining Windows capture-pool buffers. Capture sleeps while hidden and creates a fresh session and pool on each hold. The overlay is excluded from monitor capture, and dispatcher/presentation queues are bounded. Nonblocking presentation can replace older queued images rather than waiting for the queue's availability signal.
+
+Unavailable Windows capture falls back to desktop duplication, then to the [Windows Magnification API](https://learn.microsoft.com/en-us/windows/win32/winauto/magapi/magapi-intro). Capture interruptions use the native fallback and retry GPU capture on the next hold. These fallbacks can be slower. Runtime logs report the selected backend and, after a hold of at least half a second, `capturedSourceFps` and `submittedFps` separately. Windows capture counts delivered image surfaces; desktop duplication counts distinct image timestamps and excludes cursor-only events. Neither counter proves physical display refreshes. Pipeline diagnostics also report capture notifications, render requests, rate-limited draws, advisory queue-signal misses, rejected nonblocking presents, and average capture/present call costs. Exclusive fullscreen support depends on the game's presentation mode; protected content may prevent capture. The native fallback requires a 64-bit process on 64-bit Windows; the supplied x64 installer meets that requirement.
 
 ### `hs.alert.show(text, optionsOrKind?, durationMs?)`
 
@@ -103,7 +140,7 @@ Operation toasts show a loading spinner and elapsed timer by default. `update(te
 
 ### `console.log`, `console.info`, `console.warn`, `console.error`
 
-Writes to `%APPDATA%\HsWin\config-logs\MM-dd-yyyy-HH-mm.log`. Objects are JSON-serialized; `Error` values use their stack or message.
+Writes to `%APPDATA%\HsWin\config-logs\yyyy-MM-dd-HH-mm.log`. Objects are JSON-serialized; `Error` values use their stack or message.
 
 ```js
 console.log("Reloading config");
@@ -161,11 +198,11 @@ if (result.success) {
 }
 ```
 
-Options are `cwd`/`workingDirectory`/`directory` and `timeoutMs`/`timeout`; the default timeout is 30000 ms. The result has `command`, `success`, `status` (same as `success`), `exitCode`, `output`, `error`, and `timedOut`.
+Options are `cwd`/`workingDirectory`/`directory` and `timeoutMs`/`timeout`; the default timeout is 10000 ms for `hs.execute` (it blocks the script) and 30000 ms for `hs.task.run`. A command that times out has its whole process tree killed. The result has `command`, `success`, `status` (same as `success`), `exitCode`, `output`, `error`, and `timedOut`.
 
 ### `hs.task.run(command, options?, callback)`
 
-Runs a command through `cmd.exe /S /C` on a background thread and calls `callback(result)` when it finishes. The returned handle supports `stop()`, `dispose()`, and `delete()`; stopping it suppresses the callback, and config reload stops outstanding task handles automatically.
+Runs a command through `cmd.exe /S /C` on a background thread and calls `callback(result)` when it finishes. The returned handle supports `stop()`, `dispose()`, and `delete()`; stopping it kills the command's process tree and suppresses the callback, and config reload stops outstanding task handles automatically.
 
 ```js
 hs.alert.show("Working…", {
@@ -266,7 +303,7 @@ hs.hotkey.bind(["ctrl", "alt"], "mouse.middle", () => hs.alert.show("Middle mous
 
 Supported modifiers are `alt`, `option`, `opt`, `ctrl`, `control`, `shift`, `cmd`, `command`, `win`, `windows`, and `meta`.
 
-`key` is a letter (`A`-`Z`), digit (`0`-`9`), function key (`F1`-`F24`), a named key, or a mouse button. Named keyboard keys include `backspace`, `delete`/`del`, `tab`, `enter`/`return`, `escape`/`esc`, `space`, `pageup`, `pagedown`, `home`, `end`, arrows, `insert`/`ins`, punctuation names (`semicolon`, `comma`, `period`, `slash`, and others), and punctuation literals such as `` ` ``, `-`, `=`, `[`, `]`. Mouse button keys include `mouse.middle`, `mouse.back`, `mouse.forward`, `middle`, `back`, `forward`, `thumb1`, `thumb2`, `xbutton1`, `xbutton2`, `button3`–`button5`, and related `mouse.*` forms.
+`key` is a letter (`A`-`Z`), digit (`0`-`9`), function key (`F1`-`F24`, any casing, so `"f5"` and `"F5"` both work), a named key, or a mouse button. Named keyboard keys include `backspace`, `delete`/`del`, `tab`, `enter`/`return`, `escape`/`esc`, `space`, `pageup`, `pagedown`, `home`, `end`, arrows, `insert`/`ins`, `capslock`, `numlock`, `scrolllock`, `pause`, `printscreen`, `apps`, punctuation names (`semicolon`, `comma`, `period`, `slash`, and others), and punctuation literals such as `` ` ``, `-`, `=`, `[`, `]`. Keypad keys are `pad0`–`pad9` (also `numpad0`, `keypad0`), `padadd`, `padsubtract`, `padmultiply`, `paddivide`, and `paddecimal`. Media keys are `mute`, `volumeup`, `volumedown`, `playpause`, `nexttrack`, `previoustrack`, and `stop`. `hs.keyboard.*` calls additionally accept the modifier keys themselves, including left/right variants such as `lalt`, `ralt`/`altgr`, `lshift`, `rctrl`, and `lwin`. Mouse button keys include `mouse.middle`, `mouse.back`, `mouse.forward`, `middle`, `back`, `forward`, `thumb1`, `thumb2`, `xbutton1`, `xbutton2`, `button3`–`button5`, and related `mouse.*` forms.
 
 `bind` returns a registration handle; config reload disposes it automatically. You rarely need to keep the return value.
 
@@ -475,7 +512,7 @@ mic.setVolume(80);
 mic.setMuted(false);
 ```
 
-`hs.audio.record(optionsOrPath?, callback)` records from the default microphone unless `deviceId` is supplied. The callback receives `started`, `level`, `stopped`, and `error` events. Recording handles support `stop()`, `dispose()`, and `delete()`; config reload stops active recordings automatically.
+`hs.audio.record(optionsOrPath?, callback)` records from the default microphone unless `deviceId` is supplied. The callback receives `started`, `level`, `stopped`, and `error` events. Recording handles support `stop()`, `dispose()`, and `delete()`. `stop()` finishes the file (MP3/AAC are encoded first) and then reports a final `stopped` event with the path; `dispose()`/`delete()` end the recording immediately without waiting, which is also what config reload does to active recordings. If no default input device exists the call fails with a clear error instead of recording silence.
 
 ```js
 const recorder = hs.audio.record({
@@ -671,10 +708,11 @@ Options:
 | `includeInjected` | `false` | When `true`, callbacks also receive synthetic events. |
 | `blocking` | `false` | When `true`, the callback runs synchronously on the keyboard hook path and may return `true` to swallow the event. Aliases are `synchronous`, `sync`, `swallow`, `preventDefault`, `prevent`, and `capture`. |
 | `key` / `keys` | all keys | Restricts the watcher to one key or an array of keys. Values can be key names or numeric virtual-key codes. Use this for blocking watchers whenever possible so unrelated keypresses never enter JavaScript on the hook path. Aliases are `keyCode` and `keyCodes`. |
+| `prepend` | `false` | When `true`, this watcher is consulted before watchers registered earlier, so it can swallow a key before they see it. Aliases are `priority` and `first`. |
 
 ### `hs.keyboard.remap(sourceKey, targetKey)`
 
-Remaps one physical keyboard key to another. The source key is swallowed on both keydown and keyup; each source keydown sends the target key. Remaps are handled in native host code rather than JavaScript callbacks, so normal typing stays responsive even while remaps are active. Config reload disposes remaps automatically.
+Remaps one physical keyboard key to another. The source key is swallowed on both keydown and keyup. The target key is held down for as long as the source key is held (including the source's auto-repeat) and released when the source is released, so remapping a key to a modifier or a held game key behaves like the real key; disposing the remap while the source is held releases the target so it can never stick. A source key that was already down before the remap was created is released normally. Remaps take priority over ordinary watchers and are handled in native host code rather than JavaScript callbacks, so normal typing stays responsive even while remaps are active. Config reload disposes remaps automatically.
 
 ```js
 hs.keyboard.remap("pageup", "end");
@@ -705,6 +743,8 @@ if (hs.keyboard.isDown("alt")) {
 }
 ```
 
+Bare `keyDown` holds are tracked host-side: config reload and Emergency Stop release any key still held, so script-held keys (for example hands-free auto-walk) can never stick.
+
 `tap` defaults to `SendInput`, the supported Win32 global input injection API. `repeat` emits immediate taps and rejects modifier keys because an instantaneous modifier transition is generally unobservable. For continuously sampled actions, use `repeatPulse` with a positive `keyDownMs` so the application observes a held phase. Pass `inputMethod: "windowMessage"` (aliases: `window-message`, `postMessage`, `window`) only as an alternate delivery path for applications that ignore injected input but process posted `WM_KEYDOWN`/`WM_KEYUP`; some GLFW applications do not update gameplay state from posted messages. When called inside a blocking `hs.keyboard.watch` callback, HsWin queues the injected input until the hook callback returns so the physical key can be swallowed first. For ordinary key-to-key remaps, use `hs.keyboard.remap` instead. Pass `modifiers` / `withModifiers` / `holdModifiers` to hold modifiers while tapping the key. To use modifiers as a trigger chord while sending a plain key, temporarily suppress them around the tap:
 
 ```js
@@ -715,7 +755,7 @@ Aliases for `suppressPhysicalModifiers` are `suppressModifiers` and `withoutModi
 
 For modifier keys, `hs.keyboard.isDown` uses the low-level hook's physical-key tracker while the hook is active. Injected key-up events used by `suppressPhysicalModifiers` therefore do not make a physically held Ctrl, Shift, Alt, or Win key appear released to script lifecycle checks.
 
-Both repeat APIs accept `intervalMs`/`interval` (default `10`, allowed range `1`–`1000`), the same `suppressPhysicalModifiers` / `suppressModifiers` / `withoutModifiers` aliases as `tap`, and optional `inputMethod` / `method` (`sendInput` default, or `windowMessage`). `repeatPulse` additionally requires `keyDownMs` (aliases: `holdMs`, `pressDurationMs`) greater than `0` and less than `intervalMs`; `repeat` rejects held-duration options so tap and pulse semantics cannot be confused. The repeat handle supports `setIntervalMs(ms)` / `intervalMs` to change rate without restarting; pulse intervals must remain greater than `keyDownMs`. `hs.keyboard.stopRepeat()` force-stops the active keyboard repeat session.
+Both repeat APIs accept `intervalMs`/`interval` (default `10`, allowed range `1`–`1000`), `modifiers` / `withModifiers` / `holdModifiers` to hold modifiers around every repeated press (as with `tap`), the same `suppressPhysicalModifiers` / `suppressModifiers` / `withoutModifiers` aliases as `tap`, and optional `inputMethod` / `method` (`sendInput` default, or `windowMessage`). `repeatPulse` additionally requires `keyDownMs` (aliases: `holdMs`, `pressDurationMs`) greater than `0` and less than `intervalMs`; `repeat` rejects held-duration options so tap and pulse semantics cannot be confused. The repeat handle supports `setIntervalMs(ms)` / `intervalMs` to change rate without restarting; pulse intervals must remain greater than `keyDownMs`. `hs.keyboard.stopRepeat()` force-stops the active keyboard repeat session.
 
 `repeat` and `repeatPulse` run natively and log start/stop performance summaries including the effective interval. They are much faster than implementing a high-frequency loop in JavaScript with `hs.timer.doEvery`. The host keeps only one active native repeat at a time, replaces any previous repeat when a new one starts, and releases suppressed modifiers without re-pressing them on every tick. While a repeat is active, suppressed physical modifiers also have a native hook fallback so they cannot leak merely because the JavaScript callback gate is busy. Window-message repeats release those modifiers in both global input state and the target window's message state. Returned handles support `stop()`, `dispose()`, and `delete()` (any casing).
 
@@ -735,7 +775,9 @@ timer.stop();
 
 ### Example config
 
-The default `config.js` created on first run combines application checks, alerts, hotkeys, media controls, and a user-scripted Alt+Shift turbo-repeat. The repeat helper uses an explicit `starting` state so rapid physical keydown callbacks cannot create multiple native repeat handles before the first one is stored.
+The `config.js` created on first run is deliberately small and harmless: it logs `Config loaded` and binds `Ctrl+Alt+Shift+H` to a greeting toast, with commented-out one-liners for the other APIs. It never overwrites an existing config.
+
+The larger example below is not the default; it combines application checks, alerts, hotkeys, media controls, and a user-scripted Alt+Shift turbo-repeat. The repeat helper uses an explicit `starting` state so rapid physical keydown callbacks cannot create multiple native repeat handles before the first one is stored.
 
 ```js
 console.log("Reloading config");
@@ -889,12 +931,12 @@ hs.hotkey.bind([], "pageup", () => {
 
 ## Logs
 
-- Runtime diagnostics: `%APPDATA%\HsWin\runtime-logs\MM-dd-yyyy-HH-mm.log`
-- JavaScript console output: `%APPDATA%\HsWin\config-logs\MM-dd-yyyy-HH-mm.log`
+- Runtime diagnostics: `%APPDATA%\HsWin\runtime-logs\yyyy-MM-dd-HH-mm.log`
+- JavaScript console output: `%APPDATA%\HsWin\config-logs\yyyy-MM-dd-HH-mm.log`
 
-The runtime diagnostics log rotates on every app launch. The JavaScript console log rotates on every config reload.
+The runtime diagnostics log rotates on every app launch. The JavaScript console log rotates on every config reload. Log files older than 14 days are deleted at startup, always keeping the newest 20 files in each folder. If logging cannot keep up, entries are dropped (with a single `Dropped N log entries` warning) rather than slowing the app down.
 
-Runtime diagnostics intentionally redact shell command text and URL query values. Logs keep command fingerprints, lengths, HTTP method, host/path, and other request metadata instead of persisting likely secrets from automation scripts.
+Runtime diagnostics intentionally avoid private data. They never record toast text, window titles, typed or swallowed key names, or clipboard contents; shell command text is replaced by a fingerprint and length; URL query values are redacted (query keys, host, and path are kept); and launch targets are reduced to a file name or a redacted URL. Your own `console.*` output goes to the config log exactly as you write it, so avoid logging secrets there.
 
 Recent builds also write timing lines to the runtime log for hotkey dispatch, toast show/layout/position, and media commands (`Toast show timing`, `Media session timing`, `elapsedMs=...`). Keyboard remapping diagnostics log physical navigation key events, watcher swallow decisions, deferred injected input, and deferred input completion. Use these when tuning perceived latency or debugging remaps.
 

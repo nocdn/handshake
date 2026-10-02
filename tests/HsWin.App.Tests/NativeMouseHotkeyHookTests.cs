@@ -1,8 +1,10 @@
+using HsWin.App.Native;
 using System.Runtime.InteropServices;
 using HsWin.App.Hotkeys;
 using HsWin.Core.Hotkeys;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
+using HsWin.Core.Mouse;
 
 namespace HsWin.App.Tests;
 
@@ -177,109 +179,58 @@ public sealed class NativeMouseHotkeyHookTests
         Assert.Equal(0, released);
     }
 
-    private sealed class FakeMouseHookPlatform : IMouseHookPlatform
+    [Fact]
+    public void PhysicalObserversBypassUiContextAndCoexistWithHeldHotkeys()
     {
-        private readonly ManualResetEventSlim _quitSignal = new(false);
-        private MouseHookProcedure? _hookProcedure;
+        var platform = new FakeMouseHookPlatform();
+        var context = new CapturingSynchronizationContext();
+        using var hook = new NativeMouseHotkeyHook(NullRuntimeLogger.Instance, platform, context);
+        var events = new List<PhysicalMouseButtonEvent>();
+        var pressed = 0;
+        using var hotkey = hook.RegisterHeld(HotkeyDefinition.CreateMouseButton(HotkeyModifiers.None, HotkeyMouseButton.XButton1),
+            () => pressed++, () => { }, blocking: false);
+        var observer = hook.WatchPhysicalButtons(events.Add);
+        Assert.Equal(nint.Zero, platform.InvokeHook(0x020B, 1u << 16));
+        Assert.Equal(1, context.PostCount); // Only the old hotkey uses UI dispatch.
+        Assert.Equal(1, pressed);
+        Assert.Equal(new PhysicalMouseButtonEvent(HotkeyMouseButton.XButton1, true, HotkeyModifiers.None), Assert.Single(events));
+        hotkey.Dispose();
+        Assert.Equal(0, platform.UnhookCount); // Native observer still owns the shared hook.
+        platform.InvokeHook(0x020C, 1u << 16);
+        Assert.False(events[1].IsDown);
+        observer.Dispose();
+        Assert.Equal(1, platform.UnhookCount);
+        platform.InvokeHook(0x020B, 1u << 16);
+        Assert.Equal(2, events.Count);
+    }
 
-        public int SetHookExCount { get; private set; }
+    [Fact]
+    public void PhysicalObserversIgnoreInjectedInputAndUsePhysicalModifiers()
+    {
+        var platform = new FakeMouseHookPlatform();
+        using var hook = new NativeMouseHotkeyHook(NullRuntimeLogger.Instance, platform, callbackContext: null,
+            keyboardEvents: new StubKeyboardEventService(KeyboardKeyRules.VkControl));
+        var events = new List<PhysicalMouseButtonEvent>();
+        using var observer = hook.WatchPhysicalButtons(events.Add);
+        Assert.Equal(nint.Zero, platform.InvokeHook(0x020B, 1u << 16, flags: 1));
+        Assert.Empty(events);
+        platform.InvokeHook(0x020B, 1u << 16);
+        Assert.Equal(HotkeyModifiers.Control, Assert.Single(events).Modifiers);
+        hook.Dispose();
+        platform.InvokeHook(0x020C, 1u << 16);
+        Assert.Single(events);
+    }
 
-        public int UnhookCount { get; private set; }
-
-        public int QuitPostedCount { get; private set; }
-
-        public uint HookThreadId { get; private set; }
-
-        public ManualResetEventSlim InstallCompleted { get; } = new(false);
-
-        public IntPtr SetWindowsHookEx(int idHook, MouseHookProcedure hookProcedure, IntPtr moduleHandle, uint threadId)
-        {
-            SetHookExCount++;
-            _hookProcedure = hookProcedure;
-            InstallCompleted.Set();
-            return new IntPtr(0x1234);
-        }
-
-        public bool UnhookWindowsHookEx(IntPtr hookHandle)
-        {
-            UnhookCount++;
-            return true;
-        }
-
-        public IntPtr CallNextHookEx(IntPtr hookHandle, int code, IntPtr wParam, IntPtr lParam) =>
-            IntPtr.Zero;
-
-        public short GetAsyncKeyState(int virtualKey) => 0;
-
-        public int GetMessage(out NativeMessage message, IntPtr windowHandle, uint messageFilterMin, uint messageFilterMax)
-        {
-            _quitSignal.Wait(TimeSpan.FromSeconds(5));
-            message = default;
-            return 0;
-        }
-
-        public bool TranslateMessage(ref NativeMessage message) => true;
-
-        public IntPtr DispatchMessage(ref NativeMessage message) => IntPtr.Zero;
-
-        public bool PostThreadMessage(uint threadId, int message, IntPtr wParam, IntPtr lParam)
-        {
-            if (message == 0x0012)
-            {
-                QuitPostedCount++;
-                _quitSignal.Set();
-            }
-
-            return true;
-        }
-
-        public uint GetCurrentThreadId()
-        {
-            HookThreadId = (uint)Environment.CurrentManagedThreadId;
-            return HookThreadId;
-        }
-
-        public IntPtr GetModuleHandle(string? moduleName) => new IntPtr(1);
-
-        public IntPtr InvokeHook(int message, uint mouseData)
-        {
-            if (_hookProcedure is null)
-            {
-                throw new InvalidOperationException("Hook procedure was not installed.");
-            }
-
-            var hookData = new MouseHookData
-            {
-                MouseData = mouseData
-            };
-
-            var pointer = Marshal.AllocHGlobal(Marshal.SizeOf<MouseHookData>());
-            try
-            {
-                Marshal.StructureToPtr(hookData, pointer, false);
-                return _hookProcedure(0, new IntPtr(message), pointer);
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(pointer);
-            }
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MouseHookData
-        {
-            public int X;
-
-            public int Y;
-
-            public uint MouseData;
-
-            public uint Flags;
-
-            public uint Time;
-
-            public UIntPtr ExtraInfo;
-        }
+    [Fact]
+    public void FailedObserverDoesNotInterruptOtherObserversOrMouseDelivery()
+    {
+        var platform = new FakeMouseHookPlatform();
+        using var hook = new NativeMouseHotkeyHook(NullRuntimeLogger.Instance, platform, callbackContext: null);
+        using var failed = hook.WatchPhysicalButtons(_ => throw new InvalidOperationException("failed observer"));
+        var observed = 0;
+        using var healthy = hook.WatchPhysicalButtons(_ => observed++);
+        Assert.Equal(nint.Zero, platform.InvokeHook(0x020B, 1u << 16));
+        Assert.Equal(1, observed);
     }
 
     private sealed class StubKeyboardEventService(params uint[] downKeys) : IKeyboardEventService

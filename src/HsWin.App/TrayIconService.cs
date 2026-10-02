@@ -8,34 +8,21 @@ internal sealed class TrayIconService : IDisposable
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _startAtLoginItem;
     private readonly ToolStripMenuItem _installCliItem;
-    private readonly Func<bool> _isStartAtLoginEnabled;
-    private readonly Action<bool> _setStartAtLoginEnabled;
-    private readonly Func<bool> _isCliInstalled;
-    private readonly Action _installCli;
+    private readonly TrayMenuActions _actions;
     private bool _disposed;
 
-    public TrayIconService(
-        Action openConfig,
-        Action reloadConfig,
-        Action emergencyStop,
-        Func<bool> isStartAtLoginEnabled,
-        Action<bool> setStartAtLoginEnabled,
-        Func<bool> isCliInstalled,
-        Action installCli,
-        Action quit)
+    public TrayIconService(TrayMenuActions actions)
     {
-        _isStartAtLoginEnabled = isStartAtLoginEnabled;
-        _setStartAtLoginEnabled = setStartAtLoginEnabled;
-        _isCliInstalled = isCliInstalled;
-        _installCli = installCli;
+        ArgumentNullException.ThrowIfNull(actions);
+        _actions = actions;
 
         var contextMenu = new ContextMenuStrip();
-        contextMenu.Items.Add(new ToolStripMenuItem("Open Config", image: null, onClick: (_, _) => openConfig()));
-        contextMenu.Items.Add(new ToolStripMenuItem("Reload Config", image: null, onClick: (_, _) => reloadConfig()));
+        contextMenu.Items.Add(new ToolStripMenuItem("Open Config", image: null, onClick: (_, _) => actions.OpenConfig()));
+        contextMenu.Items.Add(new ToolStripMenuItem("Reload Config", image: null, onClick: (_, _) => actions.ReloadConfig()));
         contextMenu.Items.Add(new ToolStripMenuItem(
             "Emergency Stop (Ctrl+Alt+Shift+Esc)",
             image: null,
-            onClick: (_, _) => emergencyStop()));
+            onClick: (_, _) => actions.EmergencyStop()));
 
         _startAtLoginItem = new ToolStripMenuItem("Start at Login")
         {
@@ -53,7 +40,7 @@ internal sealed class TrayIconService : IDisposable
         {
             Enabled = false
         });
-        contextMenu.Items.Add(new ToolStripMenuItem("Quit", image: null, onClick: (_, _) => quit()));
+        contextMenu.Items.Add(new ToolStripMenuItem("Quit", image: null, onClick: (_, _) => actions.Quit()));
         contextMenu.Opening += (_, _) => RefreshMenuState();
 
         _notifyIcon = new NotifyIcon
@@ -64,6 +51,9 @@ internal sealed class TrayIconService : IDisposable
             Visible = false
         };
     }
+
+    /// <summary>The tray menu, exposed so tests can drive it without a visible shell icon.</summary>
+    internal ContextMenuStrip ContextMenu => _notifyIcon.ContextMenuStrip!;
 
     public void Show()
     {
@@ -84,20 +74,19 @@ internal sealed class TrayIconService : IDisposable
 
     private void ToggleStartAtLogin()
     {
-        _setStartAtLoginEnabled(!_isStartAtLoginEnabled());
+        _actions.StartAtLogin.SetEnabled(!_actions.StartAtLogin.IsEnabled());
         RefreshMenuState();
     }
 
     private void InstallCli()
     {
-        _installCli();
+        _actions.Cli.Install();
         RefreshMenuState();
     }
 
     private void RefreshMenuState()
     {
-        _startAtLoginItem.Checked = _isStartAtLoginEnabled();
-        var cliInstalled = _isCliInstalled();
-        _installCliItem.Enabled = !cliInstalled;
+        _startAtLoginItem.Checked = _actions.StartAtLogin.IsEnabled();
+        _installCliItem.Enabled = !_actions.Cli.IsInstalled();
     }
 }

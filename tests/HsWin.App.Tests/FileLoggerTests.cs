@@ -1,4 +1,5 @@
 using System.IO;
+using HsWin.Core.Logging;
 
 namespace HsWin.App.Tests;
 
@@ -20,6 +21,40 @@ public sealed class FileLoggerTests
         Assert.Contains("[WARN] careful", contents, StringComparison.Ordinal);
         Assert.Contains("[ERROR] failed", contents, StringComparison.Ordinal);
         Assert.Contains("boom", contents, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EntriesWithoutAnExceptionAreNotFollowedByABlankLine()
+    {
+        using var directory = TemporaryDirectory.Create();
+        var logger = FileLogger.CreateForLaunch(directory.Path);
+
+        logger.Info("one");
+        logger.Warning("two");
+        logger.Dispose();
+
+        Assert.DoesNotContain(File.ReadAllLines(logger.LogFilePath), string.IsNullOrWhiteSpace);
+    }
+
+    [Fact]
+    public async Task LogRetentionTaskRemovesOldLogsAndReportsIt()
+    {
+        using var directory = TemporaryDirectory.Create();
+        var extra = 5;
+        for (var index = 0; index < LogRetention.DefaultMinimumKept + extra; index++)
+        {
+            var path = Path.Combine(directory.Path, $"log-{index}.log");
+            File.WriteAllText(path, "old");
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddDays(-365).AddMinutes(index));
+        }
+
+        var logger = new CapturingRuntimeLogger();
+
+        await LogRetentionTask.Start(logger, directory.Path, Path.Combine(directory.Path, "missing"));
+
+        Assert.Equal(LogRetention.DefaultMinimumKept, Directory.GetFiles(directory.Path, "*.log").Length);
+        Assert.Contains(logger.Infos, message => message.Contains($"Removed {extra} old log", StringComparison.Ordinal));
+        Assert.Empty(logger.Errors);
     }
 
     [Fact]

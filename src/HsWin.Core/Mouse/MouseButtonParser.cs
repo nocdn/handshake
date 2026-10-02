@@ -61,12 +61,17 @@ public static class MouseButtonParser
             throw new ArgumentException("Mouse button cannot be empty.", nameof(value));
         }
 
-        if (Aliases.TryGetValue(Normalize(button), out var parsedButton))
+        if (TryParse(button, out var parsedButton))
         {
             return parsedButton;
         }
 
         throw new ArgumentException($"Unsupported mouse button '{button}'.", nameof(value));
+    }
+
+    public static bool TryParse(string name, out MouseButton button)
+    {
+        return Aliases.TryGetValue(Normalize(name), out button);
     }
 
     public static string GetDisplayName(MouseButton button)

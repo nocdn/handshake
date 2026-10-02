@@ -1,3 +1,4 @@
+using HsWin.Core.Input;
 using HsWin.Core.Hotkeys;
 using HsWin.Core.Keyboard;
 
@@ -101,7 +102,7 @@ public sealed class KeyboardScriptOptionsParserTests
 
         Assert.Equal(5, options.IntervalMs);
         Assert.Equal(HotkeyModifiers.Alt | HotkeyModifiers.Shift, options.SuppressPhysicalModifiers);
-        Assert.Equal(KeyboardInputMethod.SendInput, options.InputMethod);
+        Assert.Equal(InputMethod.SendInput, options.InputMethod);
     }
 
     [Fact]
@@ -116,7 +117,7 @@ public sealed class KeyboardScriptOptionsParserTests
             });
 
         Assert.Equal(20, options.IntervalMs);
-        Assert.Equal(KeyboardInputMethod.WindowMessage, options.InputMethod);
+        Assert.Equal(InputMethod.WindowMessage, options.InputMethod);
         Assert.Equal(8, options.KeyDownMs);
     }
 
@@ -156,7 +157,7 @@ public sealed class KeyboardScriptOptionsParserTests
         var options = KeyboardScriptOptionsParser.ParseTapOptions(
             new Dictionary<string, object?> { ["method"] = "postMessage" });
 
-        Assert.Equal(KeyboardInputMethod.WindowMessage, options.InputMethod);
+        Assert.Equal(InputMethod.WindowMessage, options.InputMethod);
     }
 
     [Fact]

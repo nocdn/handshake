@@ -1,4 +1,4 @@
-using System.Globalization;
+using HsWin.Core.Input;
 using HsWin.Core.Scripting;
 
 namespace HsWin.Core.Mouse;
@@ -15,9 +15,9 @@ public static class MouseScriptOptionsParser
         var intervalValue = ScriptArgumentReader.GetPropertyValue(value, "intervalMs", "interval");
         var intervalMs = ScriptArgumentReader.IsMissing(intervalValue)
             ? MouseRepeatOptions.Default.IntervalMs
-            : ConvertToRepeatInterval(intervalValue!);
+            : RepeatTiming.ParseIntervalMs(intervalValue);
 
-        var inputMethod = MouseInputMethodParser.Parse(
+        var inputMethod = InputMethodParser.Parse(
             ScriptArgumentReader.GetPropertyValue(value, "inputMethod", "method"));
 
         return new MouseRepeatOptions(intervalMs, inputMethod);
@@ -44,18 +44,12 @@ public static class MouseScriptOptionsParser
         var prepend = ScriptArgumentReader.GetPropertyValue(value, "prepend", "priority", "first");
 
         return new MouseScrollWatchOptions(
-            ScriptArgumentReader.IsMissing(includeInjected)
-                ? MouseScrollWatchOptions.Default.IncludeInjected
-                : Convert.ToBoolean(includeInjected, CultureInfo.InvariantCulture),
-            ScriptArgumentReader.IsMissing(blocking)
-                ? MouseScrollWatchOptions.Default.Blocking
-                : Convert.ToBoolean(blocking, CultureInfo.InvariantCulture),
+            ScriptArgumentReader.OptionalBoolean(includeInjected, "includeInjected", MouseScrollWatchOptions.Default.IncludeInjected),
+            ScriptArgumentReader.OptionalBoolean(blocking, "preventDefault", MouseScrollWatchOptions.Default.Blocking),
             ScriptArgumentReader.IsMissing(axes)
                 ? MouseScrollWatchOptions.Default.Axes
                 : ParseScrollAxes(axes),
-            ScriptArgumentReader.IsMissing(prepend)
-                ? false
-                : Convert.ToBoolean(prepend, CultureInfo.InvariantCulture));
+            ScriptArgumentReader.OptionalBoolean(prepend, "prepend", defaultValue: false));
     }
 
     public static MouseScrollAxis ParseScrollAxes(object? value)
@@ -102,29 +96,5 @@ public static class MouseScriptOptionsParser
                 $"Unknown mouse scroll axis '{value}'. Use vertical, horizontal, or both.",
                 nameof(value))
         };
-    }
-
-    private static int ConvertToRepeatInterval(object value)
-    {
-        try
-        {
-            var intervalMs = Convert.ToInt32(value, CultureInfo.InvariantCulture);
-            if (intervalMs is < MouseRepeatOptions.MinimumIntervalMs or > MouseRepeatOptions.MaximumIntervalMs)
-            {
-                throw new ArgumentOutOfRangeException(
-                    nameof(value),
-                    $"Mouse repeat interval must be between {MouseRepeatOptions.MinimumIntervalMs} and {MouseRepeatOptions.MaximumIntervalMs} milliseconds.");
-            }
-
-            return intervalMs;
-        }
-        catch (FormatException exception)
-        {
-            throw new ArgumentException("intervalMs must be a number of milliseconds.", nameof(value), exception);
-        }
-        catch (InvalidCastException exception)
-        {
-            throw new ArgumentException("intervalMs must be a number of milliseconds.", nameof(value), exception);
-        }
     }
 }

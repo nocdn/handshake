@@ -442,7 +442,13 @@
     if (request.json !== undefined) {
       request.body = JSON.stringify(request.json);
       request.contentType = request.contentType || "application/json";
-      request.headers = { ...(request.headers || {}), Accept: request.headers?.Accept || "application/json" };
+      const headers = { ...(request.headers || {}) };
+      // Header names are case-insensitive; keep any Accept the script already set.
+      if (!Object.keys(headers).some(name => name.toLowerCase() === "accept")) {
+        headers.Accept = "application/json";
+      }
+
+      request.headers = headers;
     }
 
     return request;
@@ -452,10 +458,6 @@
     if (typeof options === "function") {
       callback = options;
       options = undefined;
-    }
-
-    if (typeof urlOrOptions === "object" && typeof options === "function") {
-      callback = options;
     }
 
     if (typeof callback !== "function") {
@@ -597,6 +599,16 @@
   };
 
   globalThis.hs = Object.freeze({
+    magnifier: Object.freeze({
+      new(options) {
+        return host.Magnifier.Create(options);
+      },
+
+      bindHeld(modifiers, key, options) {
+        return host.Magnifier.BindHeld(modifiers, key, options);
+      }
+    }),
+
     execute(command, options) {
       return parseJson(host.Shell.ExecuteCommandJson(command, options));
     },
@@ -773,12 +785,11 @@
           throw new Error("Mouse scroll watch callback must be a function.");
         }
 
-      // Callbacks always run off the low-level mouse hook. preventDefault swallows natively
-        // while the watcher is registered; the return value is not used for swallow decisions.
+        // Callbacks always run off the low-level mouse hook. preventDefault swallows every
+        // matching event natively while the watcher is registered; the return value is ignored.
         return host.Mouse.WatchScroll(
           (axis, direction, delta, notches, isVertical, isHorizontal, isInjected, modifierFlags, x, y) => {
             callback(buildScrollEvent(axis, direction, delta, notches, isVertical, isHorizontal, isInjected, modifierFlags, x, y));
-            return false;
           }, options);
       }
     }),

@@ -172,14 +172,7 @@ public static class AlertRequestParser
             return trend;
         }
 
-        try
-        {
-            trend = Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture);
-        }
-        catch (Exception exception) when (exception is FormatException or InvalidCastException or OverflowException)
-        {
-            throw new ArgumentException("Alert trend must be -1, 0, or 1.", "trend", exception);
-        }
+        trend = ScriptArgumentReader.RequireInt32(value, "trend", "-1, 0, or 1");
 
         if (trend is not -1 and not 0 and not 1)
         {
@@ -224,14 +217,7 @@ public static class AlertRequestParser
             return null;
         }
 
-        try
-        {
-            return Convert.ToBoolean(value, System.Globalization.CultureInfo.InvariantCulture);
-        }
-        catch (Exception exception) when (exception is FormatException or InvalidCastException)
-        {
-            throw new ArgumentException("Alert bounce must be a boolean.", "bounce", exception);
-        }
+        return ScriptArgumentReader.RequireBoolean(value, "bounce");
     }
 
     private static int ConvertToRollDurationMs(object? value, string argumentName)

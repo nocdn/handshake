@@ -1,4 +1,5 @@
-using System.Globalization;
+using HsWin.Core.Keyboard;
+using static HsWin.Core.Config.ConfigSourceScanner;
 
 namespace HsWin.Core.Config;
 
@@ -44,7 +45,7 @@ internal static class ConfigKeyboardRepeatLiteralAnalyzer
     {
         diagnostic = null;
         nextIndex = index + 1;
-        if (!IsTokenBoundaryBefore(source, index) || !HasPrefix(source, index, KeyboardPrefix))
+        if (!IsCallPrefix(source, index, KeyboardPrefix))
         {
             return false;
         }
@@ -80,7 +81,7 @@ internal static class ConfigKeyboardRepeatLiteralAnalyzer
 
         if (methodName == "repeat" && isModifier)
         {
-            diagnostic = CreateDiagnostic(
+            diagnostic = CreateError(
                 source,
                 index,
                 "HSWIN002",
@@ -115,7 +116,7 @@ internal static class ConfigKeyboardRepeatLiteralAnalyzer
         {
             diagnostic = duration == DurationStatus.Missing
                 ? CreateMissingDurationDiagnostic(source, index)
-                : CreateDiagnostic(
+                : CreateError(
                     source,
                     index,
                     "HSWIN003",
@@ -211,12 +212,9 @@ internal static class ConfigKeyboardRepeatLiteralAnalyzer
                 return false;
             }
 
-            isModifier = value.Equals("shift", StringComparison.OrdinalIgnoreCase)
-                || value.Equals("ctrl", StringComparison.OrdinalIgnoreCase)
-                || value.Equals("control", StringComparison.OrdinalIgnoreCase)
-                || value.Equals("alt", StringComparison.OrdinalIgnoreCase)
-                || value.Equals("win", StringComparison.OrdinalIgnoreCase)
-                || value.Equals("windows", StringComparison.OrdinalIgnoreCase);
+            // Only names the runtime accepts; an unknown key is reported by the runtime pass instead.
+            isModifier = KeyboardKeyRules.TryParseKeyName(value, out var namedKey)
+                && KeyboardKeyRules.IsModifierVirtualKey(namedKey);
             return true;
         }
 
@@ -225,286 +223,19 @@ internal static class ConfigKeyboardRepeatLiteralAnalyzer
             return false;
         }
 
-        isModifier = virtualKey is 0x10 or 0x11 or 0x12 or 0x5B or 0x5C
-            or >= 0xA0 and <= 0xA5;
+        isModifier = virtualKey >= 0 && KeyboardKeyRules.IsModifierVirtualKey((uint)virtualKey);
         return true;
-    }
-
-    private static bool TryReadQuotedValue(
-        string source,
-        int index,
-        out string value,
-        out int nextIndex)
-    {
-        value = string.Empty;
-        nextIndex = index;
-        if (index >= source.Length || source[index] is not ('\'' or '"'))
-        {
-            return false;
-        }
-
-        var quote = source[index];
-        var builder = new System.Text.StringBuilder();
-        for (var current = index + 1; current < source.Length; current++)
-        {
-            if (source[current] == '\\' && current + 1 < source.Length)
-            {
-                builder.Append(source[++current]);
-                continue;
-            }
-
-            if (source[current] == quote)
-            {
-                value = builder.ToString();
-                nextIndex = current + 1;
-                return true;
-            }
-
-            builder.Append(source[current]);
-        }
-
-        nextIndex = source.Length;
-        return false;
-    }
-
-    private static bool TryReadIdentifier(
-        string source,
-        int index,
-        out string identifier,
-        out int nextIndex)
-    {
-        identifier = string.Empty;
-        nextIndex = index;
-        if (index >= source.Length || !IsIdentifierStart(source[index]))
-        {
-            return false;
-        }
-
-        var current = index + 1;
-        while (current < source.Length && IsIdentifierPart(source[current]))
-        {
-            current++;
-        }
-
-        identifier = source[index..current];
-        nextIndex = current;
-        return true;
-    }
-
-    private static bool TryReadInteger(string source, int index, out int value, out int nextIndex)
-    {
-        value = 0;
-        nextIndex = index;
-        var current = index;
-        if (current + 2 <= source.Length
-            && current + 1 < source.Length
-            && source[current] == '0'
-            && source[current + 1] is 'x' or 'X')
-        {
-            current += 2;
-            var digitsStart = current;
-            while (current < source.Length && Uri.IsHexDigit(source[current]))
-            {
-                current++;
-            }
-
-            if (current == digitsStart
-                || !int.TryParse(source[digitsStart..current], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value))
-            {
-                return false;
-            }
-
-            nextIndex = current;
-            return true;
-        }
-
-        if (!TryReadNumber(source, index, out var number, out nextIndex)
-            || number != Math.Truncate(number)
-            || number is < int.MinValue or > int.MaxValue)
-        {
-            return false;
-        }
-
-        value = (int)number;
-        return true;
-    }
-
-    private static bool TryReadNumber(string source, int index, out double value, out int nextIndex)
-    {
-        value = 0;
-        nextIndex = index;
-        var current = index;
-        if (current < source.Length && source[current] is '+' or '-')
-        {
-            current++;
-        }
-
-        var hasDigit = false;
-        while (current < source.Length && (char.IsAsciiDigit(source[current]) || source[current] == '_'))
-        {
-            hasDigit |= char.IsAsciiDigit(source[current]);
-            current++;
-        }
-
-        if (current < source.Length && source[current] == '.')
-        {
-            current++;
-            while (current < source.Length && (char.IsAsciiDigit(source[current]) || source[current] == '_'))
-            {
-                hasDigit |= char.IsAsciiDigit(source[current]);
-                current++;
-            }
-        }
-
-        if (!hasDigit)
-        {
-            return false;
-        }
-
-        var literal = source[index..current].Replace("_", string.Empty, StringComparison.Ordinal);
-        if (!double.TryParse(literal, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
-        {
-            return false;
-        }
-
-        nextIndex = current;
-        return true;
-    }
-
-    private static int FindMatchingBrace(string source, int start)
-    {
-        var depth = 0;
-        for (var index = start; index < source.Length;)
-        {
-            if (TrySkipNonCode(source, index, out var nextIndex))
-            {
-                index = nextIndex;
-                continue;
-            }
-
-            if (source[index] == '{')
-            {
-                depth++;
-            }
-            else if (source[index] == '}' && --depth == 0)
-            {
-                return index + 1;
-            }
-
-            index++;
-        }
-
-        return source.Length;
-    }
-
-    private static bool TrySkipNonCode(string source, int index, out int nextIndex)
-    {
-        nextIndex = index;
-        if (source[index] is '\'' or '"' or '`')
-        {
-            var quote = source[index];
-            for (var current = index + 1; current < source.Length; current++)
-            {
-                if (source[current] == '\\')
-                {
-                    current++;
-                    continue;
-                }
-
-                if (source[current] == quote)
-                {
-                    nextIndex = current + 1;
-                    return true;
-                }
-            }
-
-            nextIndex = source.Length;
-            return true;
-        }
-
-        if (index + 1 >= source.Length || source[index] != '/')
-        {
-            return false;
-        }
-
-        if (source[index + 1] == '/')
-        {
-            var newline = source.IndexOf('\n', index + 2);
-            nextIndex = newline < 0 ? source.Length : newline + 1;
-            return true;
-        }
-
-        if (source[index + 1] == '*')
-        {
-            var end = source.IndexOf("*/", index + 2, StringComparison.Ordinal);
-            nextIndex = end < 0 ? source.Length : end + 2;
-            return true;
-        }
-
-        return false;
     }
 
     private static ConfigLintDiagnostic CreateMissingDurationDiagnostic(string source, int index) =>
-        CreateDiagnostic(
+        CreateError(
             source,
             index,
             "HSWIN003",
             "`hs.keyboard.repeatPulse` requires `keyDownMs > 0` so sampled applications observe the key-down phase.");
 
-    private static ConfigLintDiagnostic CreateDiagnostic(
-        string source,
-        int index,
-        string code,
-        string message)
-    {
-        var (line, column) = GetLocation(source, index);
-        return new ConfigLintDiagnostic(ConfigLintSeverity.Error, code, message, line, column);
-    }
-
     private static bool IsDurationProperty(string value) =>
-        value is "keyDownMs" or "holdMs" or "pressDurationMs";
-
-    private static int SkipWhiteSpace(string source, int index)
-    {
-        while (index < source.Length && char.IsWhiteSpace(source[index]))
-        {
-            index++;
-        }
-
-        return index;
-    }
-
-    private static bool IsTokenBoundaryBefore(string source, int index) =>
-        index == 0 || (!IsIdentifierPart(source[index - 1]) && source[index - 1] != '.');
-
-    private static bool HasPrefix(string source, int index, string prefix) =>
-        index >= 0
-        && index <= source.Length - prefix.Length
-        && source.AsSpan(index, prefix.Length).SequenceEqual(prefix);
-
-    private static bool IsIdentifierStart(char value) => char.IsAsciiLetter(value) || value is '_' or '$';
-
-    private static bool IsIdentifierPart(char value) => char.IsAsciiLetterOrDigit(value) || value is '_' or '$';
-
-    private static (int Line, int Column) GetLocation(string source, int index)
-    {
-        var line = 1;
-        var column = 1;
-        for (var current = 0; current < index && current < source.Length; current++)
-        {
-            if (source[current] == '\n')
-            {
-                line++;
-                column = 1;
-            }
-            else
-            {
-                column++;
-            }
-        }
-
-        return (line, column);
-    }
+        KeyboardScriptOptionsParser.KeyDownPropertyNames.Contains(value);
 
     private enum DurationStatus
     {

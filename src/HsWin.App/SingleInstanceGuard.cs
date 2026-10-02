@@ -18,7 +18,7 @@ internal sealed class SingleInstanceGuard : IDisposable
 
     public static SingleInstanceGuard Acquire(IRuntimeLogger logger)
     {
-        return Acquire(logger, MutexName, PreviousInstanceCleaner.TerminatePreviousInstances, WaitAfterCleanup);
+        return Acquire(logger, MutexName, PreviousInstanceCleaner.StopPreviousInstances, WaitAfterCleanup);
     }
 
     internal static SingleInstanceGuard Acquire(
@@ -37,7 +37,7 @@ internal sealed class SingleInstanceGuard : IDisposable
 
         if (!TryAcquire(mutex, TimeSpan.Zero, logger))
         {
-            logger.Warning("Another HsWin single-instance guard is active; stopping previous instances before startup continues.");
+            logger.Warning("Another HsWin single-instance guard is active; asking previous instances to quit before startup continues.");
             terminatePreviousInstances(logger);
             cleaned = true;
 

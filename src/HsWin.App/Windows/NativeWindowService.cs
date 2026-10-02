@@ -1,7 +1,7 @@
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Text;
+using HsWin.App.Native;
+using HsWin.App.Threading;
 using HsWin.Core.Logging;
 using HsWin.Core.Windows;
 
@@ -18,10 +18,6 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
     private const int GwOwner = 4;
     private const int GwlExstyle = -20;
     private const long WsExToolwindow = 0x00000080L;
-    private const int SwShownormal = 1;
-    private const int SwShowminimized = 2;
-    private const int SwShowmaximized = 3;
-    private const int SwRestore = 9;
     private const uint SwpNozorder = 0x0004;
     private const uint SwpNoactivate = 0x0010;
     private const uint SwpNoownerzorder = 0x0200;
@@ -30,23 +26,18 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
 
     private readonly object _gate = new();
     private readonly IRuntimeLogger _logger;
-    private readonly WindowHookThreadScheduler _hookThread;
+    private readonly DedicatedDispatcherThread _hookThread;
     private readonly WinEventProcedure _eventProcedure;
     private readonly Dictionary<long, FocusWatch> _focusWatches = [];
     private IntPtr _eventHook;
     private long _nextWatchId;
-    private bool _disposed;
+    private int _disposed;
 
     public NativeWindowService(IRuntimeLogger logger)
-        : this(logger, new WindowHookThreadScheduler(SynchronizationContext.Current))
-    {
-    }
-
-    internal NativeWindowService(IRuntimeLogger logger, WindowHookThreadScheduler hookThread)
     {
         _logger = logger;
-        _hookThread = hookThread;
         _eventProcedure = HandleWinEvent;
+        _hookThread = new DedicatedDispatcherThread("HsWin Window Events");
     }
 
     public WindowSnapshot? GetFocusedWindow()
@@ -87,7 +78,7 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
         }
 
         var currentFrame = ShouldUseRestoreFrame(placement)
-            ? placement.RcNormalPosition.ToSnapshot()
+            ? ToSnapshot(placement.RcNormalPosition)
             : visibleFrame;
         if (currentFrame.Width <= 0 || currentFrame.Height <= 0)
         {
@@ -119,59 +110,78 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
 
     public IDisposable WatchFocused(Action<WindowSnapshot> callback)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(callback);
 
+        var watch = new FocusWatch(Interlocked.Increment(ref _nextWatchId), callback, RemoveWatch);
         lock (_gate)
         {
-            _hookThread.Run(EnsureEventHook);
-            var watch = new FocusWatch(Interlocked.Increment(ref _nextWatchId), callback, RemoveWatch);
             _focusWatches[watch.Id] = watch;
             _logger.Info($"Window focus watch registered id={watch.Id} count={_focusWatches.Count}.");
-            return watch;
         }
+
+        try
+        {
+            SyncEventHook();
+        }
+        catch
+        {
+            watch.Dispose();
+            throw;
+        }
+
+        return watch;
     }
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
 
         lock (_gate)
         {
-            foreach (var watch in _focusWatches.Values.ToArray())
+            foreach (var watch in _focusWatches.Values)
             {
                 watch.MarkDisposed();
             }
 
             _focusWatches.Clear();
-            _hookThread.Run(UnhookEvents);
-            _disposed = true;
         }
+
+        try
+        {
+            SyncEventHook();
+        }
+        catch (TimeoutException exception)
+        {
+            _logger.Error("Foreground window event hook was not removed before shutdown.", exception);
+        }
+
+        _hookThread.Dispose();
     }
 
     private bool TryMoveWindow(IntPtr handle, WindowRectangleSnapshot targetFrame, WindowPlacement placement)
     {
-        var targetRect = Rect.FromSnapshot(targetFrame);
+        var targetRect = FromSnapshot(targetFrame);
         if (WindowMoveStrategySelector.Select(placement.ShowCmd) == WindowMoveStrategy.RestoreMoveAndMaximize)
         {
             placement.RcNormalPosition = targetRect;
-            placement.ShowCmd = SwShownormal;
+            placement.ShowCmd = ShowWindowCommand.ShowNormal;
             if (!User32.SetWindowPlacement(handle, ref placement))
             {
                 LogLastWin32Error("SetWindowPlacement failed while setting maximized restore bounds.");
                 return false;
             }
 
-            User32.ShowWindow(handle, SwRestore);
+            User32.ShowWindow(handle, ShowWindowCommand.Restore);
             if (!TrySetWindowFrame(handle, targetFrame))
             {
                 return false;
             }
 
-            User32.ShowWindow(handle, SwShowmaximized);
+            User32.ShowWindow(handle, ShowWindowCommand.ShowMaximized);
             return true;
         }
 
@@ -184,9 +194,9 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
                 return false;
             }
 
-            if (placement.ShowCmd == SwShowminimized)
+            if (placement.ShowCmd == ShowWindowCommand.ShowMinimized)
             {
-                User32.ShowWindow(handle, SwRestore);
+                User32.ShowWindow(handle, ShowWindowCommand.Restore);
             }
 
             return true;
@@ -214,7 +224,7 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
     }
 
     private static bool ShouldUseRestoreFrame(WindowPlacement placement) =>
-        placement.ShowCmd is SwShowminimized or SwShowmaximized;
+        placement.ShowCmd is ShowWindowCommand.ShowMinimized or ShowWindowCommand.ShowMaximized;
 
     private void HandleWinEvent(
         IntPtr hookHandle,
@@ -262,12 +272,12 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
             return false;
         }
 
-        User32.GetWindowThreadProcessId(handle, out var processId);
+        var processId = NativeWindowInfo.GetProcessId(handle);
         snapshot = new WindowSnapshot(
             WindowId.Format(handle),
-            GetWindowTitle(handle),
+            NativeWindowInfo.GetTitle(handle),
             unchecked((int)processId),
-            GetProcessName(processId),
+            NativeWindowInfo.GetProcessName(processId),
             frame,
             User32.IsIconic(handle),
             User32.IsZoomed(handle),
@@ -314,7 +324,7 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
             return false;
         }
 
-        frame = rect.ToSnapshot();
+        frame = ToSnapshot(rect);
         return frame.Width > 0 && frame.Height > 0;
     }
 
@@ -333,52 +343,45 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
             return false;
         }
 
-        var info = MonitorInfo.Create();
+        var info = NativeMonitorInfo.Create();
         if (!User32.GetMonitorInfo(monitor, ref info))
         {
             return false;
         }
 
-        area = (useWorkingArea ? info.WorkArea : info.Monitor).ToSnapshot();
+        area = ToSnapshot(useWorkingArea ? info.WorkArea : info.Monitor);
         return true;
     }
 
-    private static string GetWindowTitle(IntPtr handle)
+    /// <summary>
+    /// Installs or removes the WinEvent hook to match the current watches. Never called under
+    /// <see cref="_gate"/>: the hook thread takes that lock to dispatch focus changes, so holding
+    /// it while waiting on the hook thread would deadlock against a focus change.
+    /// </summary>
+    private void SyncEventHook()
     {
-        var length = User32.GetWindowTextLength(handle);
-        if (length <= 0)
-        {
-            return string.Empty;
-        }
+        _hookThread.Invoke(
+            () =>
+            {
+                bool wanted;
+                lock (_gate)
+                {
+                    wanted = _focusWatches.Count > 0;
+                }
 
-        var builder = new StringBuilder(length + 1);
-        return User32.GetWindowText(handle, builder, builder.Capacity) > 0
-            ? builder.ToString()
-            : string.Empty;
+                if (wanted)
+                {
+                    InstallEventHook();
+                }
+                else
+                {
+                    UninstallEventHook();
+                }
+            },
+            "window focus hook update");
     }
 
-    private static string? GetProcessName(uint processId)
-    {
-        try
-        {
-            using var process = Process.GetProcessById(unchecked((int)processId));
-            return process.ProcessName;
-        }
-        catch (ArgumentException)
-        {
-            return null;
-        }
-        catch (InvalidOperationException)
-        {
-            return null;
-        }
-        catch (Win32Exception)
-        {
-            return null;
-        }
-    }
-
-    private void EnsureEventHook()
+    private void InstallEventHook()
     {
         if (_eventHook != IntPtr.Zero)
         {
@@ -405,22 +408,23 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
 
     private void RemoveWatch(FocusWatch watch)
     {
+        bool removed;
         lock (_gate)
         {
-            if (!_focusWatches.Remove(watch.Id))
+            removed = _focusWatches.Remove(watch.Id);
+            if (removed)
             {
-                return;
+                _logger.Info($"Window focus watch disposed id={watch.Id} count={_focusWatches.Count}.");
             }
+        }
 
-            _logger.Info($"Window focus watch disposed id={watch.Id} count={_focusWatches.Count}.");
-            if (_focusWatches.Count == 0)
-            {
-                _hookThread.Run(UnhookEvents);
-            }
+        if (removed && Volatile.Read(ref _disposed) == 0)
+        {
+            SyncEventHook();
         }
     }
 
-    private void UnhookEvents()
+    private void UninstallEventHook()
     {
         if (_eventHook == IntPtr.Zero)
         {
@@ -491,37 +495,11 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
         uint eventThread,
         uint eventTime);
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Point
-    {
-        public int X;
+    private static NativeRect FromSnapshot(WindowRectangleSnapshot snapshot) =>
+        new(snapshot.X, snapshot.Y, snapshot.X + snapshot.Width, snapshot.Y + snapshot.Height);
 
-        public int Y;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Rect
-    {
-        public int Left;
-
-        public int Top;
-
-        public int Right;
-
-        public int Bottom;
-
-        public static Rect FromSnapshot(WindowRectangleSnapshot snapshot) =>
-            new()
-            {
-                Left = snapshot.X,
-                Top = snapshot.Y,
-                Right = snapshot.X + snapshot.Width,
-                Bottom = snapshot.Y + snapshot.Height
-            };
-
-        public WindowRectangleSnapshot ToSnapshot() =>
-            new(Left, Top, Math.Max(0, Right - Left), Math.Max(0, Bottom - Top));
-    }
+    private static WindowRectangleSnapshot ToSnapshot(NativeRect rect) =>
+        new(rect.Left, rect.Top, Math.Max(0, rect.Width), Math.Max(0, rect.Height));
 
     [StructLayout(LayoutKind.Sequential)]
     private struct WindowPlacement
@@ -532,29 +510,14 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
 
         public int ShowCmd;
 
-        public Point MinPosition;
+        public NativePoint MinPosition;
 
-        public Point MaxPosition;
+        public NativePoint MaxPosition;
 
-        public Rect RcNormalPosition;
+        public NativeRect RcNormalPosition;
 
         public static WindowPlacement Create() =>
             new() { Length = (uint)Marshal.SizeOf<WindowPlacement>() };
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct MonitorInfo
-    {
-        public uint Size;
-
-        public Rect Monitor;
-
-        public Rect WorkArea;
-
-        public uint Flags;
-
-        public static MonitorInfo Create() =>
-            new() { Size = (uint)Marshal.SizeOf<MonitorInfo>() };
     }
 
     private static partial class User32
@@ -589,7 +552,7 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
 
         [LibraryImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        public static partial bool GetWindowRect(IntPtr windowHandle, out Rect rect);
+        public static partial bool GetWindowRect(IntPtr windowHandle, out NativeRect rect);
 
         [LibraryImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -615,20 +578,11 @@ internal sealed partial class NativeWindowService : IWindowService, IDisposable
         public static partial bool ShowWindow(IntPtr windowHandle, int command);
 
         [LibraryImport("user32.dll")]
-        public static partial uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetWindowTextLength(IntPtr windowHandle);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetWindowText(IntPtr windowHandle, StringBuilder text, int maxCount);
-
-        [LibraryImport("user32.dll")]
         public static partial IntPtr MonitorFromWindow(IntPtr windowHandle, uint flags);
 
         [LibraryImport("user32.dll", EntryPoint = "GetMonitorInfoW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        public static partial bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo monitorInfo);
+        public static partial bool GetMonitorInfo(IntPtr monitor, ref NativeMonitorInfo monitorInfo);
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern IntPtr SetWinEventHook(

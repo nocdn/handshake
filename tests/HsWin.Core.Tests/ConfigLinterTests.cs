@@ -106,4 +106,99 @@ public sealed class ConfigLinterTests
 
         Assert.DoesNotContain(result.Diagnostics, item => item.Code is "HSWIN002" or "HSWIN003");
     }
+
+    [Fact]
+    public void LintSourceReportsRuntimeErrorLocationInsideTheUserConfig()
+    {
+        var result = new ConfigLinter().LintSource("""
+            const unused = 1;
+
+            hs.hotkey.bind(["hyper"], "A", () => {});
+            """);
+
+        var diagnostic = Assert.Single(result.Diagnostics);
+        Assert.Equal("HSWIN100", diagnostic.Code);
+        Assert.Equal(3, diagnostic.Line);
+        Assert.NotNull(diagnostic.Column);
+        Assert.DoesNotContain("config.js:", diagnostic.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LintSourceKeepsRuntimeErrorOnADifferentLineFromAStaticDiagnostic()
+    {
+        var result = new ConfigLinter().LintSource("""
+            hs.hotkey.bind(["ctrl"], "A", () => {
+              hs.timer.doAfter(0, () => {});
+            });
+            hs.hotkey.bind(["hyper"], "B", () => {});
+            """);
+
+        Assert.Contains(result.Diagnostics, item => item.Code == "HSWIN001" && item.Line == 2);
+        Assert.Contains(result.Diagnostics, item => item.Code == "HSWIN100" && item.Line == 4);
+    }
+
+    [Fact]
+    public void LintSourceDoesNotRepeatAStaticDiagnosticAsARuntimeError()
+    {
+        var result = new ConfigLinter().LintSource("""hs.timer.doEvery(0, () => {});""");
+
+        var diagnostic = Assert.Single(result.Diagnostics);
+        Assert.Equal("HSWIN001", diagnostic.Code);
+    }
+
+    [Fact]
+    public void LintSourceStopsAConfigThatNeverFinishesLoading()
+    {
+        var linter = new ConfigLinter(TimeSpan.FromMilliseconds(200));
+
+        var result = linter.LintSource("""
+            let count = 0;
+            while (true) {
+              count++;
+            }
+            """);
+
+        var diagnostic = Assert.Single(result.Diagnostics);
+        Assert.Equal("HSWIN100", diagnostic.Code);
+        Assert.Contains("did not finish", diagnostic.Message, StringComparison.Ordinal);
+        Assert.Contains("endless loop", diagnostic.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("alt")]
+    [InlineData("WIN")]
+    [InlineData("lctrl")]
+    [InlineData("rshift")]
+    [InlineData("0x10")]
+    [InlineData("165")]
+    public void LintSourceRecognizesEveryModifierNameTheRuntimeAccepts(string key)
+    {
+        var literal = char.IsAsciiDigit(key[0]) ? key : $"\"{key}\"";
+
+        var result = new ConfigLinter().LintSource($"hs.keyboard.repeat({literal}, {{ intervalMs: 120 }});");
+
+        var diagnostic = Assert.Single(result.Diagnostics);
+        Assert.Equal("HSWIN002", diagnostic.Code);
+    }
+
+    [Fact]
+    public void LintSourceLeavesUnknownKeyNamesToTheRuntimeCheck()
+    {
+        var result = new ConfigLinter().LintSource("""hs.keyboard.repeat("hyper", { intervalMs: 120 });""");
+
+        var diagnostic = Assert.Single(result.Diagnostics);
+        Assert.Equal("HSWIN100", diagnostic.Code);
+    }
+
+    [Theory]
+    [InlineData("holdMs")]
+    [InlineData("pressDurationMs")]
+    public void LintSourceAcceptsKeyDownAliasesForPulses(string propertyName)
+    {
+        var result = new ConfigLinter().LintSource(
+            $$"""hs.keyboard.repeatPulse("shift", { intervalMs: 120, {{propertyName}}: 40 });""");
+
+        Assert.True(result.Success);
+        Assert.Empty(result.Diagnostics);
+    }
 }

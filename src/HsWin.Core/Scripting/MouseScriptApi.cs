@@ -57,11 +57,11 @@ public sealed class MouseScriptApi
         _logger.Info($"Script hs.mouse.click('{MouseButtonParser.GetDisplayName(parsedButton)}') requested.");
     }
 
-    public MouseRepeatScriptHandle Repeat(object? button, object? options = null)
+    public RepeatScriptHandle Repeat(object? button, object? options = null)
     {
         var parsedButton = MouseButtonParser.Parse(button);
         var parsedOptions = MouseScriptOptionsParser.ParseRepeatOptions(options);
-        var handle = new MouseRepeatScriptHandle(_mouseInput.Repeat(parsedButton, parsedOptions));
+        var handle = new RepeatScriptHandle(_mouseInput.Repeat(parsedButton, parsedOptions));
         _trackResource(handle);
         _logger.Info(
             $"Script hs.mouse.repeat('{MouseButtonParser.GetDisplayName(parsedButton)}') intervalMs={parsedOptions.IntervalMs}.");
@@ -89,7 +89,7 @@ public sealed class MouseScriptApi
                 // Primitive fields marshal into V8 far cheaper than a serialized JSON string
                 // (bootstrap.js rebuilds the frozen event object from them). Field order must
                 // match the bootstrap adapter's parameter list.
-                var result = _callbacks.InvokeScriptCallback(
+                _callbacks.InvokeScriptCallback(
                     scriptFunction,
                     scrollEvent.Axis,
                     scrollEvent.Direction,
@@ -101,9 +101,6 @@ public sealed class MouseScriptApi
                     scrollEvent.ModifierFlags,
                     scrollEvent.X,
                     scrollEvent.Y);
-                // Return value is only meaningful for usage warnings on non-preventDefault watchers.
-                // preventDefault swallow is decided natively on the hook path without JS.
-                return Convert.ToBoolean(result, CultureInfo.InvariantCulture);
             });
 
         var handle = new ScriptResourceHandle(registration);

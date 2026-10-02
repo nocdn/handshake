@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
+using HsWin.Core.Scripting;
 
 namespace HsWin.App.Keyboard;
 
@@ -14,11 +15,11 @@ internal sealed class KeyboardWatchDispatcher
     internal static readonly TimeSpan BlockingCallbackWarnAfter = TimeSpan.FromMilliseconds(8);
 
     private readonly IRuntimeLogger _logger;
-    private readonly IKeyboardWatchCallbackScheduler _scheduler;
+    private readonly IScriptCallbackScheduler _scheduler;
 
     public KeyboardWatchDispatcher(
         IRuntimeLogger logger,
-        IKeyboardWatchCallbackScheduler scheduler)
+        IScriptCallbackScheduler scheduler)
     {
         _logger = logger;
         _scheduler = scheduler;
@@ -104,9 +105,11 @@ internal sealed class KeyboardWatchDispatcher
 
         try
         {
-            if (subscription.Callback(snapshot))
+            if (subscription.Callback(snapshot) && subscription.TryMarkNonBlockingReturnWarned())
             {
-                _logger.Warning($"Keyboard watch callback returned true for non-blocking watcher id={subscription.Id}; use blocking=true to swallow input.");
+                _logger.Warning(
+                    $"Keyboard watch id={subscription.Id} returned true, but it is not blocking, so keys are not " +
+                    "swallowed. Pass { blocking: true } to swallow keys. (Logged once per watch.)");
             }
         }
         catch (Exception exception)
@@ -116,38 +119,11 @@ internal sealed class KeyboardWatchDispatcher
     }
 }
 
-internal interface IKeyboardWatchCallbackScheduler
-{
-    void Schedule(Action callback);
-}
-
-internal sealed class SynchronizationContextKeyboardWatchCallbackScheduler : IKeyboardWatchCallbackScheduler
-{
-    private readonly SynchronizationContext? _context;
-
-    public SynchronizationContextKeyboardWatchCallbackScheduler(SynchronizationContext? context)
-    {
-        _context = context;
-    }
-
-    public void Schedule(Action callback)
-    {
-        ArgumentNullException.ThrowIfNull(callback);
-
-        if (_context is null)
-        {
-            ThreadPool.QueueUserWorkItem(static state => ((Action)state!).Invoke(), callback);
-            return;
-        }
-
-        _context.Post(static state => ((Action)state!).Invoke(), callback);
-    }
-}
-
 internal sealed class KeyboardWatchSubscription : IDisposable
 {
     private readonly Action<KeyboardWatchSubscription>? _dispose;
     private int _disposed;
+    private int _nonBlockingReturnWarned;
 
     public KeyboardWatchSubscription(
         long id,
@@ -183,4 +159,7 @@ internal sealed class KeyboardWatchSubscription : IDisposable
     {
         Interlocked.Exchange(ref _disposed, 1);
     }
+
+    /// <summary>True only the first time, so a misused watch warns once instead of per key.</summary>
+    public bool TryMarkNonBlockingReturnWarned() => Interlocked.Exchange(ref _nonBlockingReturnWarned, 1) == 0;
 }

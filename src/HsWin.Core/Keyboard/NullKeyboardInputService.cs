@@ -1,3 +1,5 @@
+using HsWin.Core.Input;
+
 namespace HsWin.Core.Keyboard;
 
 public sealed class NullKeyboardInputService : IKeyboardInputService
@@ -20,7 +22,7 @@ public sealed class NullKeyboardInputService : IKeyboardInputService
     {
     }
 
-    public IKeyboardRepeatSession Repeat(uint virtualKey, KeyboardRepeatOptions options)
+    public IRepeatSession Repeat(uint virtualKey, KeyboardRepeatOptions options)
     {
         return new NullRepeatSession(options.IntervalMs);
     }
@@ -29,22 +31,7 @@ public sealed class NullKeyboardInputService : IKeyboardInputService
     {
     }
 
-    private sealed class NullRepeatSession : IKeyboardRepeatSession
+    public void ReleaseHeldKeys()
     {
-        public NullRepeatSession(int intervalMs)
-        {
-            IntervalMs = intervalMs;
-        }
-
-        public int IntervalMs { get; private set; }
-
-        public void SetIntervalMs(int intervalMs)
-        {
-            IntervalMs = intervalMs;
-        }
-
-        public void Dispose()
-        {
-        }
     }
 }

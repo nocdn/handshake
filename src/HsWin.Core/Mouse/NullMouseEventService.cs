@@ -1,3 +1,5 @@
+using HsWin.Core.Support;
+
 namespace HsWin.Core.Mouse;
 
 public sealed class NullMouseEventService : IMouseEventService
@@ -8,15 +10,8 @@ public sealed class NullMouseEventService : IMouseEventService
     {
     }
 
-    public IDisposable WatchScroll(MouseScrollWatchOptions options, Func<MouseScrollEventSnapshot, bool> callback)
+    public IDisposable WatchScroll(MouseScrollWatchOptions options, Action<MouseScrollEventSnapshot> callback)
     {
-        return new NullDisposable();
-    }
-
-    private sealed class NullDisposable : IDisposable
-    {
-        public void Dispose()
-        {
-        }
+        return EmptyDisposable.Instance;
     }
 }

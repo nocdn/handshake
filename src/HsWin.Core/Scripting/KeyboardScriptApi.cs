@@ -1,5 +1,5 @@
-using System.Globalization;
 using HsWin.Core.Hotkeys;
+using HsWin.Core.Input;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
 using Microsoft.ClearScript;
@@ -36,51 +36,26 @@ public sealed class KeyboardScriptApi
         }
 
         var parsedOptions = KeyboardScriptOptionsParser.ParseWatchOptions(options);
+        var warnedAboutNonBlockingSwallow = 0;
         var registration = _keyboardEvents.Watch(
             parsedOptions,
             keyboardEvent =>
             {
-                // Primitive fields marshal into V8 far cheaper than a serialized JSON string
-                // (bootstrap.js rebuilds the frozen event object from them). Field order must
-                // match the bootstrap adapter's parameter list.
+                // Primitive fields marshal into V8 far cheaper than a serialized JSON string;
+                // bootstrap.js rebuilds the frozen event object from them.
+                var args = ScriptEventArguments.Keyboard(keyboardEvent);
                 if (parsedOptions.Blocking)
                 {
                     // Blocking watchers run on WH_KEYBOARD_LL — fail-open if the script gate is busy
                     // so a wedged UI callback cannot freeze the physical keyboard.
-                    if (!_callbacks.TryInvokeScriptCallbackFailOpen(
-                            scriptFunction,
-                            out var blockingResult,
-                            keyboardEvent.Type,
-                            keyboardEvent.KeyCode,
-                            keyboardEvent.Key,
-                            keyboardEvent.ModifierFlags,
-                            keyboardEvent.IsKeyDown,
-                            keyboardEvent.IsKeyUp,
-                            keyboardEvent.IsModifier,
-                            keyboardEvent.IsInjected,
-                            keyboardEvent.IsExtended))
-                    {
-                        return false; // pass key through
-                    }
-
-                    return Convert.ToBoolean(blockingResult, CultureInfo.InvariantCulture);
+                    return _callbacks.TryInvokeScriptCallbackFailOpen(scriptFunction, out var blockingResult, args)
+                        && ScriptArgumentReader.IsTruthy(blockingResult);
                 }
 
-                var result = _callbacks.InvokeScriptCallback(
-                    scriptFunction,
-                    keyboardEvent.Type,
-                    keyboardEvent.KeyCode,
-                    keyboardEvent.Key,
-                    keyboardEvent.ModifierFlags,
-                    keyboardEvent.IsKeyDown,
-                    keyboardEvent.IsKeyUp,
-                    keyboardEvent.IsModifier,
-                    keyboardEvent.IsInjected,
-                    keyboardEvent.IsExtended);
-                var requestedSwallow = Convert.ToBoolean(result, CultureInfo.InvariantCulture);
-
-                if (requestedSwallow)
+                var result = _callbacks.InvokeScriptCallback(scriptFunction, args);
+                if (ScriptArgumentReader.IsTruthy(result) && Interlocked.Exchange(ref warnedAboutNonBlockingSwallow, 1) == 0)
                 {
+                    // Once per watch: this fires at typing rate.
                     _logger.Warning("Non-blocking hs.keyboard.watch() callback returned true; use { blocking: true } when a watcher must swallow keyboard input.");
                 }
 
@@ -91,44 +66,32 @@ public sealed class KeyboardScriptApi
         _trackResource(handle);
         _logger.Info(
             $"Script hs.keyboard.watch() registered includeInjected={parsedOptions.IncludeInjected} blocking={parsedOptions.Blocking} " +
-            $"keys={FormatKeyFilter(parsedOptions.KeyFilter)}.");
+            $"prepend={parsedOptions.Prepend} keys={FormatKeyFilter(parsedOptions.KeyFilter)}.");
         return handle;
     }
 
+    /// <summary>
+    /// Makes <paramref name="sourceKey"/> act as <paramref name="targetKey"/>: the target goes down
+    /// while the source is held (auto-repeat included) and up when it is released.
+    /// </summary>
     public ScriptResourceHandle Remap(object? sourceKey, object? targetKey)
     {
         var sourceVirtualKey = HotkeyParser.ParseVirtualKey(sourceKey);
         var targetVirtualKey = HotkeyParser.ParseVirtualKey(targetKey);
-        var sourceName = KeyboardKeyRules.GetDisplayName(sourceVirtualKey);
-        var targetName = KeyboardKeyRules.GetDisplayName(targetVirtualKey);
-
-        var registration = _keyboardEvents.Watch(
+        var remap = new KeyRemap(sourceVirtualKey, targetVirtualKey, _keyboardInput);
+        remap.Registration = _keyboardEvents.Watch(
             new KeyboardEventWatchOptions(
                 IncludeInjected: false,
                 Blocking: true,
                 KeyFilter: new HashSet<uint> { sourceVirtualKey },
                 Prepend: true),
-            keyboardEvent =>
-            {
-                if (keyboardEvent.KeyCode != sourceVirtualKey)
-                {
-                    return false;
-                }
+            remap.Handle);
 
-                // No per-keystroke logging here: remap matches fire at typing rate on the
-                // WH_KEYBOARD_LL thread and the registration log already states the mapping.
-                if (keyboardEvent.IsKeyDown)
-                {
-                    _keyboardInput.Tap(targetVirtualKey, KeyboardTapOptions.Default);
-                }
-
-                return true;
-            });
-
-        var handle = new ScriptResourceHandle(registration);
+        var handle = new ScriptResourceHandle(remap);
         _trackResource(handle);
         _logger.Info(
-            $"Script hs.keyboard.remap('{sourceName}', '{targetName}') registered sourceVk=0x{sourceVirtualKey:X2} targetVk=0x{targetVirtualKey:X2}.");
+            $"Script hs.keyboard.remap('{KeyboardKeyRules.GetDisplayName(sourceVirtualKey)}', '{KeyboardKeyRules.GetDisplayName(targetVirtualKey)}') " +
+            $"registered sourceVk=0x{sourceVirtualKey:X2} targetVk=0x{targetVirtualKey:X2}.");
         return handle;
     }
 
@@ -146,59 +109,33 @@ public sealed class KeyboardScriptApi
         _keyboardInput.Tap(virtualKey, parsedOptions);
     }
 
-    public KeyboardRepeatScriptHandle Repeat(object? key, object? options = null)
+    public RepeatScriptHandle Repeat(object? key, object? options = null)
     {
         return StartRepeat(key, options, pulse: false);
     }
 
-    public KeyboardRepeatScriptHandle RepeatPulse(object? key, object? options = null)
+    public RepeatScriptHandle RepeatPulse(object? key, object? options = null)
     {
         return StartRepeat(key, options, pulse: true);
     }
 
-    private KeyboardRepeatScriptHandle StartRepeat(object? key, object? options, bool pulse)
+    private RepeatScriptHandle StartRepeat(object? key, object? options, bool pulse)
     {
         var virtualKey = HotkeyParser.ParseVirtualKey(key);
         var parsedOptions = KeyboardScriptOptionsParser.ParseRepeatOptions(options);
+        KeyboardRepeatRules.Validate(virtualKey, parsedOptions, pulse);
         var displayName = KeyboardKeyRules.GetDisplayName(virtualKey);
-        if (pulse)
-        {
-            if (parsedOptions.KeyDownMs <= 0)
-            {
-                throw new ArgumentException(
-                    "hs.keyboard.repeatPulse() requires keyDownMs (or holdMs/pressDurationMs) greater than 0.",
-                    nameof(options));
-            }
-        }
-        else
-        {
-            if (parsedOptions.KeyDownMs > 0)
-            {
-                throw new ArgumentException(
-                    "Use hs.keyboard.repeatPulse() for repeats with a held key-down phase.",
-                    nameof(options));
-            }
 
-            if (KeyboardKeyRules.IsModifierVirtualKey(virtualKey))
-            {
-                _logger.Warning(
-                    $"Rejected instantaneous modifier repeat key='{displayName}' vk=0x{virtualKey:X2}; " +
-                    "use hs.keyboard.repeatPulse() with keyDownMs > 0.");
-                throw new ArgumentException(
-                    "Modifier repeats require hs.keyboard.repeatPulse() with keyDownMs greater than 0.",
-                    nameof(key));
-            }
-        }
-
-        var handle = new KeyboardRepeatScriptHandle(_keyboardInput.Repeat(virtualKey, parsedOptions));
+        var handle = new RepeatScriptHandle(_keyboardInput.Repeat(virtualKey, parsedOptions));
         _trackResource(handle);
         var methodName = pulse ? "repeatPulse" : "repeat";
         _logger.Info(
             $"Script hs.keyboard.{methodName}('{displayName}') " +
             $"intervalMs={parsedOptions.IntervalMs} " +
             $"keyDownMs={parsedOptions.KeyDownMs} " +
+            $"modifiers=0x{(uint)parsedOptions.Modifiers:X} " +
             $"suppressModifiers=0x{(uint)parsedOptions.SuppressPhysicalModifiers:X} " +
-            $"inputMethod={KeyboardInputMethodParser.GetDisplayName(parsedOptions.InputMethod)}.");
+            $"inputMethod={InputMethodParser.GetDisplayName(parsedOptions.InputMethod)}.");
         return handle;
     }
 
@@ -226,5 +163,50 @@ public sealed class KeyboardScriptApi
     {
         var virtualKey = HotkeyParser.ParseVirtualKey(key);
         return _keyboardEvents.IsKeyDown(virtualKey);
+    }
+
+    /// <summary>
+    /// One remap's state. Remap matches fire at typing rate on the WH_KEYBOARD_LL thread, so
+    /// nothing here logs per keystroke.
+    /// </summary>
+    private sealed class KeyRemap(uint sourceVirtualKey, uint targetVirtualKey, IKeyboardInputService keyboardInput) : IDisposable
+    {
+        private int _targetDown;
+
+        public IDisposable? Registration { get; set; }
+
+        public bool Handle(KeyboardEventSnapshot keyboardEvent)
+        {
+            if (keyboardEvent.KeyCode != sourceVirtualKey)
+            {
+                return false;
+            }
+
+            if (keyboardEvent.IsKeyDown)
+            {
+                Volatile.Write(ref _targetDown, 1);
+                keyboardInput.KeyDown(targetVirtualKey);
+                return true;
+            }
+
+            // A source key that went down before the remap existed must release normally.
+            if (Interlocked.Exchange(ref _targetDown, 0) == 0)
+            {
+                return false;
+            }
+
+            keyboardInput.KeyUp(targetVirtualKey);
+            return true;
+        }
+
+        public void Dispose()
+        {
+            Registration?.Dispose();
+            if (Interlocked.Exchange(ref _targetDown, 0) != 0)
+            {
+                // Removing the remap while the source is held must not leave the target stuck.
+                keyboardInput.KeyUp(targetVirtualKey);
+            }
+        }
     }
 }

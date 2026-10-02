@@ -12,7 +12,7 @@ public sealed class DatedLogFileNameTests
 
         var path = DatedLogFileName.CreateUniquePath(directory.Path, timestamp);
 
-        Assert.Equal("05-19-2026-13-47.log", Path.GetFileName(path));
+        Assert.Equal("2026-05-19-13-47.log", Path.GetFileName(path));
     }
 
     [Fact]
@@ -25,6 +25,6 @@ public sealed class DatedLogFileNameTests
 
         var secondPath = DatedLogFileName.CreateUniquePath(directory.Path, timestamp);
 
-        Assert.Equal("05-19-2026-13-47-2.log", Path.GetFileName(secondPath));
+        Assert.Equal("2026-05-19-13-47-2.log", Path.GetFileName(secondPath));
     }
 }

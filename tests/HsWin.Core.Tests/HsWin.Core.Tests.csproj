@@ -15,7 +15,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\**\*.cs" Link="Shared\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Using Include="Xunit" />
+    <Using Include="HsWin.Tests.Shared" />
   </ItemGroup>
 
   <ItemGroup>

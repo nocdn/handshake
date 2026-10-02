@@ -1,23 +1,17 @@
 namespace HsWin.Core.Support;
 
-internal sealed class DisposableAction : IDisposable
+/// <summary>Runs an action exactly once on the first <see cref="Dispose"/>, from any thread.</summary>
+public sealed class DisposableAction : IDisposable
 {
-    private readonly Action _dispose;
-    private bool _disposed;
+    private Action? _dispose;
 
     public DisposableAction(Action dispose)
     {
-        _dispose = dispose;
+        _dispose = dispose ?? throw new ArgumentNullException(nameof(dispose));
     }
 
     public void Dispose()
     {
-        if (_disposed)
-        {
-            return;
-        }
-
-        _dispose();
-        _disposed = true;
+        Interlocked.Exchange(ref _dispose, null)?.Invoke();
     }
 }

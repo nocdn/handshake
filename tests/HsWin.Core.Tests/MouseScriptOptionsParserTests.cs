@@ -1,3 +1,4 @@
+using HsWin.Core.Input;
 using HsWin.Core.Mouse;
 
 namespace HsWin.Core.Tests;
@@ -31,7 +32,7 @@ public sealed class MouseScriptOptionsParserTests
                 ["inputMethod"] = "windowMessage"
             });
 
-        Assert.Equal(MouseInputMethod.WindowMessage, options.InputMethod);
+        Assert.Equal(InputMethod.WindowMessage, options.InputMethod);
     }
 
     [Fact]
@@ -39,7 +40,7 @@ public sealed class MouseScriptOptionsParserTests
     {
         var options = MouseScriptOptionsParser.ParseRepeatOptions(null);
 
-        Assert.Equal(MouseInputMethod.SendInput, options.InputMethod);
+        Assert.Equal(InputMethod.SendInput, options.InputMethod);
     }
 
     [Fact]

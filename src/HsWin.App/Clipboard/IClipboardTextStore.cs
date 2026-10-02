@@ -1,6 +1,6 @@
 namespace HsWin.App.Clipboard;
 
-internal interface IClipboardTextStore
+internal interface IClipboardTextStore : IDisposable
 {
     ClipboardTextContents Read();
 

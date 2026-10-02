@@ -112,6 +112,53 @@ public sealed class ScrittoTextPanelTests
         }
     }
 
+    [Fact]
+    public void RestingGlyphsCarryNoBlurEffect()
+    {
+        var withEffect = RunOnStaThread(() =>
+        {
+            var panel = LayoutPanel("Count 50");
+            return CountGlyphsWithEffect(panel);
+        });
+
+        Assert.Equal(0, withEffect);
+    }
+
+    [Fact]
+    public void GlyphsAreBlurredOnlyWhileTheyAnimate()
+    {
+        var (during, atRest) = RunOnStaThread(() =>
+        {
+            var panel = LayoutPanel("Count 50");
+            panel.Roll("Count 51", 1, 300, bounce: false);
+            var animating = CountGlyphsWithEffect(panel);
+            panel.Snap("Count 51");
+            return (animating, CountGlyphsWithEffect(panel));
+        });
+
+        Assert.Equal(0, atRest);
+        if (SystemParameters.ClientAreaAnimation)
+        {
+            Assert.True(during > 0, "Entering glyphs should be blurred while they animate.");
+        }
+    }
+
+    private static int CountGlyphsWithEffect(DependencyObject root)
+    {
+        var count = 0;
+        foreach (var child in LogicalTreeHelper.GetChildren(root).OfType<DependencyObject>())
+        {
+            if (child is UIElement { Effect: not null })
+            {
+                count++;
+            }
+
+            count += CountGlyphsWithEffect(child);
+        }
+
+        return count;
+    }
+
     private static ScrittoTextPanel LayoutPanel(string value)
     {
         var panel = new ScrittoTextPanel();

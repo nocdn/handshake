@@ -1,3 +1,4 @@
+using HsWin.App.Native;
 using HsWin.App.Windows;
 
 namespace HsWin.App.Tests;
@@ -9,7 +10,7 @@ public sealed class WindowMoveStrategySelectorTests
     {
         Assert.Equal(
             WindowMoveStrategy.RestoreMoveAndMaximize,
-            WindowMoveStrategySelector.Select(WindowMoveStrategySelector.SwShowmaximized));
+            WindowMoveStrategySelector.Select(ShowWindowCommand.ShowMaximized));
     }
 
     [Fact]
@@ -17,7 +18,7 @@ public sealed class WindowMoveStrategySelectorTests
     {
         Assert.Equal(
             WindowMoveStrategy.SetRestoreBoundsAndRestore,
-            WindowMoveStrategySelector.Select(WindowMoveStrategySelector.SwShowminimized));
+            WindowMoveStrategySelector.Select(ShowWindowCommand.ShowMinimized));
     }
 
     [Fact]

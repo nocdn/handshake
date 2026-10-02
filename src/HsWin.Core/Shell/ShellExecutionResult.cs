@@ -6,7 +6,8 @@ public sealed record ShellExecutionResult(
     int? ExitCode,
     string Output,
     string Error,
-    bool TimedOut)
+    bool TimedOut,
+    bool Cancelled = false)
 {
     public bool Status => Success;
 }

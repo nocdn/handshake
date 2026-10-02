@@ -37,27 +37,9 @@ public sealed class HttpScriptApi
         }
 
         var parsedOptions = ParseRequestOptions(options);
-        var disposed = 0;
-        var request = _http.Send(parsedOptions, response =>
-        {
-            if (Volatile.Read(ref disposed) != 0)
-            {
-                return;
-            }
-
-            var responseJson = ScriptJson.Serialize(response);
-            _callbackScheduler.Schedule(() =>
-            {
-                if (Volatile.Read(ref disposed) == 0)
-                {
-                    _callbacks.InvokeScriptCallback(scriptFunction, responseJson);
-                }
-            });
-        });
-
-        var handle = new ScriptResourceHandle(new CallbackSuppressingDisposable(
-            request,
-            () => Interlocked.Exchange(ref disposed, 1)));
+        var relay = new ScriptCallbackRelay(scriptFunction, _callbackScheduler, _callbacks);
+        var request = _http.Send(parsedOptions, response => relay.PostFinal(ScriptJson.Serialize(response)));
+        var handle = relay.Attach(request);
         _trackResource(handle);
         _logger.Info($"Script hs.http.request() started method='{parsedOptions.Method}' url={LogSanitizer.DescribeUrl(parsedOptions.Url)}.");
         return handle;
@@ -95,7 +77,7 @@ public sealed class HttpScriptApi
         var timeoutValue = ScriptArgumentReader.GetPropertyValue(value, "timeoutMs", "timeout");
         var timeoutMs = ScriptArgumentReader.IsMissing(timeoutValue)
             ? HsHttpRequestOptions.DefaultTimeoutMs
-            : ConvertPositiveInt(timeoutValue, "timeoutMs");
+            : ScriptArgumentReader.RequirePositiveInt32(timeoutValue, "timeoutMs");
         var responseType = ScriptArgumentReader.OptionalString(ScriptArgumentReader.GetPropertyValue(value, "responseType", "response"));
 
         return new HsHttpRequestOptions(
@@ -200,12 +182,7 @@ public sealed class HttpScriptApi
             return parts;
         }
 
-        foreach (var fileValue in ScriptArgumentReader.EnumerateIndexedValues(filesValue))
-        {
-            parts.Add(ReadMultipartPart(fileValue));
-        }
-
-        return parts;
+        throw new ArgumentException("files must be a path, an array of { name, path } parts, or an object mapping field names to paths.", "files");
     }
 
     private static HttpMultipartPart ReadMultipartPart(object? value)
@@ -266,34 +243,5 @@ public sealed class HttpScriptApi
         }
 
         throw new ArgumentException("files must be a path, array, or object.", nameof(value));
-    }
-
-    private static int ConvertPositiveInt(object? value, string argumentName)
-    {
-        var result = ScriptArgumentReader.RequireInt32(value, argumentName, "a positive integer");
-        if (result < 1)
-        {
-            throw new ArgumentOutOfRangeException(argumentName, $"{argumentName} must be at least 1.");
-        }
-
-        return result;
-    }
-
-    private sealed class CallbackSuppressingDisposable : IDisposable
-    {
-        private readonly IDisposable _inner;
-        private readonly Action _markDisposed;
-
-        public CallbackSuppressingDisposable(IDisposable inner, Action markDisposed)
-        {
-            _inner = inner;
-            _markDisposed = markDisposed;
-        }
-
-        public void Dispose()
-        {
-            _markDisposed();
-            _inner.Dispose();
-        }
     }
 }

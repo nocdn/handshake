@@ -18,35 +18,35 @@ public sealed class ConfigFileServiceTests
     }
 
     [Fact]
-    public void DefaultConfigRefreshesApexStateOnPressInsteadOfTimerPolling()
+    public void DefaultConfigIsHarmlessForNewUsers()
     {
-        using var directory = TemporaryDirectory.Create();
-        var configPath = Path.Combine(directory.Path, "config.js");
-        var service = new ConfigFileService(configPath);
+        var config = ConfigFileService.DefaultConfig;
 
-        service.EnsureConfigFile();
+        // A first-run config must never swallow input or steal everyday keys system-wide.
+        Assert.DoesNotContain("hs.keyboard.watch(", ActiveLines(config), StringComparison.Ordinal);
+        Assert.DoesNotContain("blocking", ActiveLines(config), StringComparison.Ordinal);
+        foreach (var everydayKey in new[] { "\"`\"", "\"delete\"", "\"pageup\"", "\"space\"", "\"enter\"" })
+        {
+            Assert.DoesNotContain($"hs.hotkey.bind([], {everydayKey}", config, StringComparison.OrdinalIgnoreCase);
+        }
 
-        var config = File.ReadAllText(configPath);
-        Assert.DoesNotContain("doEvery(1000", config, StringComparison.Ordinal);
-        Assert.Contains("if (apex.refresh())", config, StringComparison.Ordinal);
+        Assert.Contains("hs.hotkey.bind([\"ctrl\", \"alt\", \"shift\"], \"H\"", config, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void EnsureConfigFileCreatesHardenedTurboRepeatState()
+    public void DefaultConfigPassesLint()
     {
         using var directory = TemporaryDirectory.Create();
         var configPath = Path.Combine(directory.Path, "config.js");
-        var service = new ConfigFileService(configPath);
+        new ConfigFileService(configPath).EnsureConfigFile();
 
-        service.EnsureConfigFile();
+        var result = new ConfigLinter().LintFile(configPath);
 
-        var config = File.ReadAllText(configPath);
-        Assert.Contains("intervalMs: 15", config, StringComparison.Ordinal);
-        Assert.Contains("state: \"idle\"", config, StringComparison.Ordinal);
-        Assert.Contains("this.state = \"starting\";", config, StringComparison.Ordinal);
-        Assert.Contains("this.state = \"running\";", config, StringComparison.Ordinal);
-        Assert.Contains("const sequence = ++this.sequence;", config, StringComparison.Ordinal);
+        Assert.Empty(result.Diagnostics);
     }
+
+    private static string ActiveLines(string config) =>
+        string.Join('\n', config.Split('\n').Where(line => !line.TrimStart().StartsWith("//", StringComparison.Ordinal)));
 
     [Fact]
     public void EnsureConfigFileDoesNotOverwriteExistingConfig()

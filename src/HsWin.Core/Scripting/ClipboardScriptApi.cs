@@ -48,13 +48,8 @@ public sealed class ClipboardScriptApi
             throw new ArgumentException("Clipboard watch callback must be a JavaScript function.", nameof(callback));
         }
 
-        var registration = _clipboard.Watch(snapshot =>
-        {
-            var eventJson = ScriptJson.Serialize(snapshot);
-            _callbackScheduler.Schedule(() => _callbacks.InvokeScriptCallback(scriptFunction, eventJson));
-        });
-
-        var handle = new ScriptResourceHandle(registration);
+        var relay = new ScriptCallbackRelay(scriptFunction, _callbackScheduler, _callbacks);
+        var handle = relay.Attach(_clipboard.Watch(snapshot => relay.Post(ScriptJson.Serialize(snapshot))));
         _trackResource(handle);
         _logger.Info("Script hs.pasteboard.watch() registered.");
         return handle;

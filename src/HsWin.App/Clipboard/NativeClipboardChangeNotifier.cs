@@ -28,19 +28,25 @@ internal sealed class NativeClipboardChangeNotifier : IClipboardChangeNotifier
     {
         ArgumentNullException.ThrowIfNull(changed);
 
-        return InvokeOnDispatcher(() =>
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            EnsureWindow();
+        // Register runs during config evaluation while holding the script gate:
+        // fail fast instead of deadlocking on a wedged dispatcher.
+        return Threading.DispatcherGuard.InvokeWithTimeout(
+            _dispatcher,
+            () =>
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                EnsureWindow();
 
-            var subscription = new ClipboardChangeSubscription(
-                Interlocked.Increment(ref _nextSubscriptionId),
-                changed,
-                RemoveSubscription);
-            _subscriptions.Add(subscription);
-            _logger.Info($"Clipboard watcher registered id={subscription.Id} count={_subscriptions.Count}.");
-            return subscription;
-        });
+                var subscription = new ClipboardChangeSubscription(
+                    Interlocked.Increment(ref _nextSubscriptionId),
+                    changed,
+                    RemoveSubscription);
+                _subscriptions.Add(subscription);
+                _logger.Info($"Clipboard watcher registered id={subscription.Id} count={_subscriptions.Count}.");
+                return subscription;
+            },
+            "clipboard watcher register",
+            Threading.DispatcherGuard.MarshalTimeout);
     }
 
     public void Dispose()
@@ -50,13 +56,16 @@ internal sealed class NativeClipboardChangeNotifier : IClipboardChangeNotifier
             return;
         }
 
+        _disposed = true;
         if (_dispatcher.HasShutdownStarted || _dispatcher.HasShutdownFinished)
         {
-            _disposed = true;
             return;
         }
 
-        InvokeOnDispatcher(DisposeOnDispatcher);
+        // Teardown runs during reload disposal while holding the script gate:
+        // never wait on the dispatcher. Subscriptions were already marked disposed
+        // synchronously where possible; the native window follows when it can.
+        Threading.DispatcherGuard.FireAndForget(_dispatcher, DisposeOnDispatcher, "clipboard teardown", _logger);
     }
 
     private void EnsureWindow()
@@ -72,19 +81,26 @@ internal sealed class NativeClipboardChangeNotifier : IClipboardChangeNotifier
             return;
         }
 
-        InvokeOnDispatcher(() =>
-        {
-            if (_subscriptions.Remove(subscription))
+        // Removal runs during reload disposal while holding the script gate: mark
+        // disposed synchronously so notifications stop at once, then queue native
+        // teardown without waiting on the dispatcher.
+        subscription.MarkDisposed();
+        Threading.DispatcherGuard.FireAndForget(
+            _dispatcher,
+            () =>
             {
-                _logger.Info($"Clipboard watcher unregistered id={subscription.Id} count={_subscriptions.Count}.");
-            }
+                if (_subscriptions.Remove(subscription))
+                {
+                    _logger.Info($"Clipboard watcher unregistered id={subscription.Id} count={_subscriptions.Count}.");
+                }
 
-            subscription.MarkDisposed();
-            if (_subscriptions.Count == 0)
-            {
-                DestroyWindow();
-            }
-        });
+                if (_subscriptions.Count == 0)
+                {
+                    DestroyWindow();
+                }
+            },
+            "clipboard watcher unregister",
+            _logger);
     }
 
     private void DispatchChanged()
@@ -106,11 +122,6 @@ internal sealed class NativeClipboardChangeNotifier : IClipboardChangeNotifier
 
     private void DisposeOnDispatcher()
     {
-        if (_disposed)
-        {
-            return;
-        }
-
         foreach (var subscription in _subscriptions)
         {
             subscription.MarkDisposed();
@@ -118,7 +129,6 @@ internal sealed class NativeClipboardChangeNotifier : IClipboardChangeNotifier
 
         _subscriptions.Clear();
         DestroyWindow();
-        _disposed = true;
     }
 
     private void DestroyWindow()
@@ -131,24 +141,6 @@ internal sealed class NativeClipboardChangeNotifier : IClipboardChangeNotifier
         _window.Dispose();
         _window = null;
         _logger.Info("Clipboard listener window destroyed.");
-    }
-
-    private T InvokeOnDispatcher<T>(Func<T> action)
-    {
-        return _dispatcher.CheckAccess()
-            ? action()
-            : _dispatcher.Invoke(action);
-    }
-
-    private void InvokeOnDispatcher(Action action)
-    {
-        if (_dispatcher.CheckAccess())
-        {
-            action();
-            return;
-        }
-
-        _dispatcher.Invoke(action);
     }
 
     private sealed class ClipboardMessageWindow : NativeWindow, IDisposable

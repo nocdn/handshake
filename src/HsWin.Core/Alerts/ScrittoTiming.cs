@@ -36,24 +36,8 @@ public static class ScrittoTiming
     public const string BounceEasing =
         "linear(0,0.0843,0.2682,0.4765,0.6659,0.8165,0.9238,0.9918,1.0289,1.044,1.0453,1.039,1.0298,1.0204,1.0123,1.0062,1.0021,1)";
 
-    /// <summary>Width/indent easing; kept in step with the box curve in the UI layer.</summary>
-    public const string ShrinkEasing = "cubic-bezier(0.22, 1, 0.36, 1)";
-
-    /// <summary>Gradient ramp of the travelling-edge band, in em.</summary>
-    public const double EdgeFadeEm = 0.3;
-
-    /// <summary>Slack past the content where the ramp lands, in em.</summary>
-    public const double EdgeSlackEm = 0.4;
-
-    /// <summary>Room above and below the line for descenders and blur, in em.</summary>
-    public const double BlockSlackEm = 0.5;
-
     /// <summary>Width changes below half a pixel do not animate the box.</summary>
     public const double MinWidthDeltaPx = 0.5;
-
-    public static double EdgeSlackPx(double fontSizePx) => fontSizePx * EdgeSlackEm;
-
-    public static double BlockSlackPx(double fontSizePx) => fontSizePx * BlockSlackEm;
 
     public static double GlyphOffsetPx(double fontSizePx) => fontSizePx * GlyphYEm;
 
@@ -118,31 +102,6 @@ public static class ScrittoTiming
         var index = (int)Math.Floor(scaled);
         var fraction = scaled - index;
         return stops[index] + (stops[index + 1] - stops[index]) * fraction;
-    }
-
-    /// <summary>
-    /// Where a <c>linear()</c> spring first reaches <c>target</c> as a
-    /// fraction of its run. Unreadable easings return the conservative 1.
-    /// </summary>
-    public static double CrossingFraction(string easing, double target)
-    {
-        var stops = ParseLinearStops(easing);
-        if (stops.Count < 2)
-        {
-            return 1;
-        }
-
-        for (var i = 1; i < stops.Count; i++)
-        {
-            if (stops[i] >= target)
-            {
-                var lo = stops[i - 1];
-                var within = lo >= target ? 0 : (target - lo) / (stops[i] - lo);
-                return (i - 1 + within) / (stops.Count - 1);
-            }
-        }
-
-        return 1;
     }
 
     /// <summary>

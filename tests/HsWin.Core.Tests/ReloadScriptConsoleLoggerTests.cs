@@ -13,7 +13,7 @@ public sealed class ReloadScriptConsoleLoggerTests
 
         logger.BeginReload("config.js");
 
-        Assert.Equal("05-19-2026-13-47.log", Path.GetFileName(logger.CurrentLogFilePath));
+        Assert.Equal("2026-05-19-13-47.log", Path.GetFileName(logger.CurrentLogFilePath));
         Assert.True(File.Exists(logger.CurrentLogFilePath));
         logger.Dispose();
     }
@@ -31,7 +31,7 @@ public sealed class ReloadScriptConsoleLoggerTests
         var secondPath = logger.CurrentLogFilePath;
 
         Assert.NotEqual(firstPath, secondPath);
-        Assert.Equal("05-19-2026-13-47-2.log", Path.GetFileName(secondPath));
+        Assert.Equal("2026-05-19-13-47-2.log", Path.GetFileName(secondPath));
         logger.Dispose();
     }
 
@@ -81,8 +81,8 @@ public sealed class ReloadScriptConsoleLoggerTests
         logger.Write("log", "second file");
 
         logger.Dispose();
-        var firstLines = File.ReadAllLines(Path.Combine(directory.Path, "05-19-2026-13-47.log"));
-        var secondLines = File.ReadAllLines(Path.Combine(directory.Path, "05-19-2026-13-47-2.log"));
+        var firstLines = File.ReadAllLines(Path.Combine(directory.Path, "2026-05-19-13-47.log"));
+        var secondLines = File.ReadAllLines(Path.Combine(directory.Path, "2026-05-19-13-47-2.log"));
         Assert.Contains(firstLines, line => line.Contains("[log] first file", StringComparison.Ordinal));
         Assert.Contains(secondLines, line => line.Contains("[log] second file", StringComparison.Ordinal));
         Assert.DoesNotContain(secondLines, line => line.Contains("first file", StringComparison.Ordinal));

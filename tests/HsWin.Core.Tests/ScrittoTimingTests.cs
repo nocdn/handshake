@@ -28,19 +28,7 @@ public sealed class ScrittoTimingTests
     public void UnreadableEasingFallsBackToConservativeAnswers()
     {
         Assert.Empty(ScrittoTiming.ParseLinearStops("bogus"));
-        Assert.Equal(1, ScrittoTiming.CrossingFraction("bogus", 0.15));
         Assert.Equal(0.5, ScrittoTiming.SampleSpring([], 0.5), precision: 9);
-    }
-
-    [Fact]
-    public void CrossingFractionStaysInsideTheRun()
-    {
-        var showsAt = ScrittoTiming.CrossingFraction(ScrittoTiming.DefaultEasing, 0.15);
-        var solidAt = ScrittoTiming.CrossingFraction(ScrittoTiming.DefaultEasing, 0.35);
-
-        Assert.InRange(showsAt, 0, 1);
-        Assert.InRange(solidAt, 0, 1);
-        Assert.True(showsAt < solidAt);
     }
 
     [Fact]

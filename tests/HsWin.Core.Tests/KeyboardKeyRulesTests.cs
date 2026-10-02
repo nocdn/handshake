@@ -65,10 +65,11 @@ public sealed class KeyboardKeyRulesTests
     }
 
     [Fact]
-    public void GetModifierNamesIgnoresNoRepeatFlag()
+    public void GetModifierNamesIgnoresBitsThatAreNotModifiers()
     {
-        Assert.Equal(
-            ["ctrl"],
-            KeyboardKeyRules.GetModifierNames(HotkeyModifiers.Control | HotkeyModifiers.NoRepeat));
+        // 0x4000 is Win32's MOD_NOREPEAT; it must never surface as a modifier name.
+        const HotkeyModifiers noRepeatBit = (HotkeyModifiers)0x4000;
+
+        Assert.Equal(["ctrl"], KeyboardKeyRules.GetModifierNames(HotkeyModifiers.Control | noRepeatBit));
     }
 }

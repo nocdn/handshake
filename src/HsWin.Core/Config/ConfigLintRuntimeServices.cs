@@ -17,7 +17,10 @@ namespace HsWin.Core.Config;
 
 internal static class ConfigLintRuntimeServices
 {
-    public static ScriptRuntimeServices Create()
+    /// <summary>Lint never waits on real I/O, so a config still running after this is looping.</summary>
+    public static readonly TimeSpan DefaultExecutionTimeout = TimeSpan.FromSeconds(5);
+
+    public static ScriptRuntimeServices Create(TimeSpan executionTimeout)
     {
         var shell = new LintShellService();
         return new ScriptRuntimeServices
@@ -40,7 +43,8 @@ internal static class ConfigLintRuntimeServices
             MouseEvents = NullMouseEventService.Instance,
             Windows = NullWindowService.Instance,
             Http = LintHttpService.Instance,
-            Logger = NullRuntimeLogger.Instance
+            Logger = NullRuntimeLogger.Instance,
+            ConfigExecutionTimeout = executionTimeout
         };
     }
 
@@ -86,7 +90,7 @@ internal static class ConfigLintRuntimeServices
 
     private sealed class LintShellService : IShellService
     {
-        public ShellExecutionResult Execute(string command, ShellExecutionOptions options) =>
+        public ShellExecutionResult Execute(string command, ShellExecutionOptions options, CancellationToken cancellationToken = default) =>
             new(command, Success: true, ExitCode: 0, Output: string.Empty, Error: string.Empty, TimedOut: false);
 
         public LaunchResult Launch(string target, LaunchOptions options) =>

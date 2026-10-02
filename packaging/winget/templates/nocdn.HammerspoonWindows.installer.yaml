@@ -20,7 +20,7 @@ Installers:
     AppsAndFeaturesEntries:
       - DisplayName: Hammerspoon (Windows Edition)
         DisplayVersion: '{{PACKAGE_VERSION}}'
-        Publisher: Hammerspoon
+        Publisher: nocdn
         ProductCode: '{5E65F5D3-AC46-43D2-B31C-B98F8757C640}_is1'
 ManifestType: installer
 ManifestVersion: 1.12.0

@@ -1,5 +1,5 @@
 #define MyAppName "Hammerspoon (Windows Edition)"
-#define MyAppPublisher "Hammerspoon"
+#define MyAppPublisher "nocdn"
 #define MyAppUrl "https://github.com/nocdn/hammerspoon-win"
 #define MyAppExeName "Hammerspoon (Windows Edition).exe"
 #define MyInstallFolderName "Hammerspoon (Windows Edition)"
@@ -17,7 +17,7 @@
 #endif
 
 #if MyPublishDir == ""
-  #define MyPublishDir "..\artifacts\publish\HsWin.App\Release\win-x64"
+  #define MyPublishDir "..\artifacts\publish\installer\Release\win-x64"
 #endif
 
 #if MyOutputDir == ""
@@ -49,8 +49,10 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} Setup
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyVersionInfoVersion}
 VersionInfoVersion={#MyVersionInfoVersion}
+; Broadcasts WM_SETTINGCHANGE after uninstall removes the hspn PATH entry.
+ChangesEnvironment=yes
 
 [Files]
 Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -61,3 +63,62 @@ Name: "{autoprograms}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Hammerspoon (Windows Edition)"; Flags: nowait postinstall skipifsilent runasoriginaluser
+
+[Code]
+const
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  EnvironmentKey = 'Environment';
+
+{ The app writes these at runtime (Start at login, Install hspn CLI), so Inno never tracked them. }
+function RemoveDirectoryFromPath(const PathValue, Directory: String): String;
+var
+  Remaining, Entry, Normalized: String;
+  Separator: Integer;
+begin
+  Result := '';
+  Remaining := PathValue;
+  Normalized := Lowercase(RemoveBackslashUnlessRoot(Directory));
+  while Remaining <> '' do
+  begin
+    Separator := Pos(';', Remaining);
+    if Separator = 0 then
+    begin
+      Entry := Remaining;
+      Remaining := '';
+    end
+    else
+    begin
+      Entry := Copy(Remaining, 1, Separator - 1);
+      Remaining := Copy(Remaining, Separator + 1, Length(Remaining));
+    end;
+
+    if (Trim(Entry) <> '') and (Lowercase(RemoveBackslashUnlessRoot(RemoveQuotes(Trim(Entry)))) <> Normalized) then
+    begin
+      if Result <> '' then
+        Result := Result + ';';
+      Result := Result + Entry;
+    end;
+  end;
+end;
+
+procedure RemoveCliFromUserPath();
+var
+  PathValue, Updated: String;
+begin
+  if RegQueryStringValue(HKEY_CURRENT_USER, EnvironmentKey, 'Path', PathValue) then
+  begin
+    Updated := RemoveDirectoryFromPath(PathValue, ExpandConstant('{app}'));
+    if Updated <> PathValue then
+      RegWriteExpandStringValue(HKEY_CURRENT_USER, EnvironmentKey, 'Path', Updated);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    RegDeleteValue(HKEY_CURRENT_USER, RunKey, '{#MyAppName}');
+    RegDeleteValue(HKEY_CURRENT_USER, RunKey, 'HsWin');
+    RemoveCliFromUserPath();
+  end;
+end;

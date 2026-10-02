@@ -4,7 +4,8 @@ namespace HsWin.Core.Logging;
 
 public static class DatedLogFileName
 {
-    public const string DateFormat = "MM-dd-yyyy-HH-mm";
+    /// <summary>Year first, so file names sort chronologically.</summary>
+    public const string DateFormat = "yyyy-MM-dd-HH-mm";
 
     public static string CreateUniquePath(string directory, DateTimeOffset timestamp)
     {

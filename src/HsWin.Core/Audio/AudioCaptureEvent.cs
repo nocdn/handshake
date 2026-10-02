@@ -14,4 +14,14 @@ public sealed record AudioCaptureEvent(
     double? Rms = null,
     string? Reason = null,
     string? ErrorCode = null,
-    string? Message = null);
+    string? Message = null)
+{
+    public const string Started = "started";
+    public const string Level = "level";
+    public const string Error = "error";
+
+    /// <summary>The last event of every recording; errors are followed by it with Reason "error".</summary>
+    public const string Stopped = "stopped";
+
+    public bool IsTerminal => Type == Stopped;
+}

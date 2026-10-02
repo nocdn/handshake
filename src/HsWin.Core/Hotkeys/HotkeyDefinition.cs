@@ -1,3 +1,5 @@
+using HsWin.Core.Keyboard;
+
 namespace HsWin.Core.Hotkeys;
 
 public sealed record HotkeyDefinition(HotkeyModifiers Modifiers, uint VirtualKey)
@@ -27,21 +29,15 @@ public sealed record HotkeyDefinition(HotkeyModifiers Modifiers, uint VirtualKey
             return $"{Modifiers}+{MouseButton}";
         }
 
-        return $"{Modifiers}+{FormatVirtualKey(VirtualKey)}";
+        return $"{Modifiers}+{FormatKey(VirtualKey)}";
     }
 
-    private static string FormatVirtualKey(uint virtualKey)
+    /// <summary>Letters and function keys read as printed on a keycap (R, F12); other keys use their script names.</summary>
+    private static string FormatKey(uint virtualKey)
     {
-        if (virtualKey is >= 'A' and <= 'Z' or >= '0' and <= '9')
-        {
-            return ((char)virtualKey).ToString();
-        }
-
-        if (virtualKey is >= 0x70 and <= 0x87)
-        {
-            return $"F{virtualKey - 0x70 + 1}";
-        }
-
-        return $"0x{virtualKey:X2}";
+        var name = KeyboardKeyRules.GetDisplayName(virtualKey);
+        var isLetter = name.Length == 1 && char.IsAsciiLetter(name[0]);
+        var isFunctionKey = name.Length is 2 or 3 && name[0] == 'f' && char.IsAsciiDigit(name[1]);
+        return isLetter || isFunctionKey ? name.ToUpperInvariant() : name;
     }
 }

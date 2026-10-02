@@ -1,3 +1,4 @@
+using HsWin.Core.Input;
 using HsWin.Core.Logging;
 using HsWin.Core.Mouse;
 
@@ -5,5 +6,5 @@ namespace HsWin.App.Input;
 
 internal interface IMouseInputSender
 {
-    void SendClick(MouseButton button, MouseInputMethod inputMethod, IRuntimeLogger? logger = null);
+    void SendClick(MouseButton button, InputMethod inputMethod, IRuntimeLogger? logger = null);
 }

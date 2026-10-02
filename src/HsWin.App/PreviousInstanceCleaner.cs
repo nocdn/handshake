@@ -1,3 +1,4 @@
+using HsWin.Core.Commands;
 using HsWin.Core.Logging;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -5,127 +6,182 @@ using System.IO;
 
 namespace HsWin.App;
 
+/// <summary>
+/// Makes room for a new instance. A running instance is first asked to quit over the command pipe,
+/// so it releases held keys and repeats and leaves the apps it launched (and an open config editor)
+/// alone. Only an instance that does not exit in time is killed, and never its process tree.
+/// </summary>
 internal static class PreviousInstanceCleaner
 {
-    private const int ExitTimeoutMs = 5_000;
+    private const int QuitConnectTimeoutMs = 1000;
+    private const int QuitResponseTimeoutMs = 2000;
+    private static readonly TimeSpan GracefulExitTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan KillExitTimeout = TimeSpan.FromSeconds(5);
 
-    public static void TerminatePreviousInstances(IRuntimeLogger logger)
+    public static void StopPreviousInstances(IRuntimeLogger logger)
     {
         ArgumentNullException.ThrowIfNull(logger);
 
         var startedAt = Stopwatch.GetTimestamp();
+        var instances = FindPreviousInstances();
+        if (instances.Count == 0)
+        {
+            logger.Info($"Previous instance cleanup found nothing elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
+            return;
+        }
+
+        try
+        {
+            var quitRequested = RequestQuitOverPipe(logger);
+            var deadline = Stopwatch.GetTimestamp() + (long)(GracefulExitTimeout.TotalSeconds * Stopwatch.Frequency);
+            var graceful = 0;
+            var killed = 0;
+            var failed = 0;
+            foreach (var instance in instances)
+            {
+                var remaining = Stopwatch.GetElapsedTime(Stopwatch.GetTimestamp(), deadline);
+                if (quitRequested && WaitForExit(instance.Process, remaining))
+                {
+                    graceful++;
+                }
+                else if (Kill(instance, logger))
+                {
+                    killed++;
+                }
+                else
+                {
+                    failed++;
+                }
+            }
+
+            logger.Info(
+                $"Previous instance cleanup completed matched={instances.Count} quitRequested={quitRequested} graceful={graceful} " +
+                $"killed={killed} failed={failed} elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
+        }
+        finally
+        {
+            foreach (var instance in instances)
+            {
+                instance.Process.Dispose();
+            }
+        }
+    }
+
+    private static bool RequestQuitOverPipe(IRuntimeLogger logger)
+    {
+        try
+        {
+            var response = new HsWinCommandClient().Send(
+                new HsWinCommandRequest(HsWinCommandNames.AppQuit),
+                QuitConnectTimeoutMs,
+                QuitResponseTimeoutMs);
+            if (!response.Success)
+            {
+                // Builds that predate app.quit answer with "Unknown command".
+                logger.Warning($"Previous instance declined the quit request: {response.Message}");
+            }
+
+            return response.Success;
+        }
+        catch (Exception exception) when (exception is TimeoutException or IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            logger.Warning($"Could not ask the previous instance to quit: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static List<PreviousInstance> FindPreviousInstances()
+    {
         using var currentProcess = Process.GetCurrentProcess();
         var currentProcessId = currentProcess.Id;
         var currentSessionId = TryGetSessionId(currentProcess);
         var currentExecutablePath = TryGetExecutablePath(currentProcess);
+        var instances = new List<PreviousInstance>();
 
-        var candidates = 0;
-        var pathChecks = 0;
-        var matched = 0;
-        var stopped = 0;
-        var failed = 0;
-
-        // Only processes whose names can ever match (the matcher terminates by known name or by
-        // path equality with this executable) are inspected. Querying by name avoids walking the
-        // whole process table — including MainModule reads — on every launch of a login-start app.
+        // Only processes whose names can ever match are inspected; querying by name avoids walking
+        // the whole process table (and its MainModule reads) on every login-start launch.
         foreach (var candidateName in PreviousInstanceProcessMatcher.CandidateProcessNames(currentExecutablePath))
         {
             foreach (var process in Process.GetProcessesByName(candidateName))
             {
-                using (process)
+                var processId = process.Id;
+                var processName = TryGetProcessName(process);
+                var sessionId = TryGetSessionId(process);
+                var matches = PreviousInstanceProcessMatcher.ShouldTerminate(
+                    processId,
+                    currentProcessId,
+                    processName,
+                    sessionId,
+                    currentSessionId,
+                    candidateExecutablePath: null,
+                    currentExecutablePath);
+                if (!matches && PreviousInstanceProcessMatcher.ShouldReadExecutablePath(processName, currentExecutablePath))
                 {
-                    candidates++;
-
-                    var processId = process.Id;
-                    if (processId == currentProcessId)
-                    {
-                        continue;
-                    }
-
-                    var processName = TryGetProcessName(process);
-                    var sessionId = TryGetSessionId(process);
-                    var shouldTerminate = PreviousInstanceProcessMatcher.ShouldTerminate(
+                    matches = PreviousInstanceProcessMatcher.ShouldTerminate(
                         processId,
                         currentProcessId,
                         processName,
                         sessionId,
                         currentSessionId,
-                        candidateExecutablePath: null,
+                        TryGetExecutablePath(process),
                         currentExecutablePath);
+                }
 
-                    string? executablePath = null;
-                    if (!shouldTerminate && PreviousInstanceProcessMatcher.ShouldReadExecutablePath(processName, currentExecutablePath))
-                    {
-                        pathChecks++;
-                        executablePath = TryGetExecutablePath(process);
-                        shouldTerminate = PreviousInstanceProcessMatcher.ShouldTerminate(
-                            processId,
-                            currentProcessId,
-                            processName,
-                            sessionId,
-                            currentSessionId,
-                            executablePath,
-                            currentExecutablePath);
-                    }
-
-                    if (!shouldTerminate)
-                    {
-                        continue;
-                    }
-
-                    executablePath ??= TryGetExecutablePath(process);
-                    matched++;
-                    if (Terminate(process, processName, processId, executablePath, logger))
-                    {
-                        stopped++;
-                    }
-                    else
-                    {
-                        failed++;
-                    }
+                if (matches)
+                {
+                    instances.Add(new PreviousInstance(process, processName, processId));
+                }
+                else
+                {
+                    process.Dispose();
                 }
             }
         }
 
-        logger.Info(
-            $"Previous instance cleanup completed candidates={candidates} pathChecks={pathChecks} matched={matched} stopped={stopped} failed={failed} " +
-            $"elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
+        return instances;
     }
 
-    private static bool Terminate(
-        Process process,
-        string processName,
-        int processId,
-        string? executablePath,
-        IRuntimeLogger logger)
+    private static bool WaitForExit(Process process, TimeSpan timeout)
     {
         try
         {
-            if (process.HasExited)
+            return process.HasExited || (timeout > TimeSpan.Zero && process.WaitForExit(timeout));
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or Win32Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool Kill(PreviousInstance instance, IRuntimeLogger logger)
+    {
+        try
+        {
+            if (instance.Process.HasExited)
             {
-                logger.Info($"Previous instance already exited processName='{processName}' id={processId}.");
                 return true;
             }
 
-            logger.Warning(
-                $"Stopping previous HsWin instance processName='{processName}' id={processId} path='{executablePath ?? "<unknown>"}'.");
+            logger.Warning($"Previous HsWin instance did not quit; stopping it processName='{instance.Name}' id={instance.Id}.");
 
-            process.Kill(entireProcessTree: true);
-            if (!process.WaitForExit(ExitTimeoutMs))
+            // Only the instance itself: apps it launched and editors it opened must survive.
+            instance.Process.Kill(entireProcessTree: false);
+            if (!instance.Process.WaitForExit(KillExitTimeout))
             {
-                logger.Warning($"Previous HsWin instance did not exit within {ExitTimeoutMs}ms id={processId}.");
+                logger.Warning($"Previous HsWin instance did not exit within {KillExitTimeout.TotalMilliseconds:F0}ms id={instance.Id}.");
                 return false;
             }
 
-            logger.Info($"Stopped previous HsWin instance processName='{processName}' id={processId}.");
             return true;
         }
         catch (Exception exception) when (exception is InvalidOperationException or Win32Exception or NotSupportedException)
         {
-            logger.Error($"Could not stop previous HsWin instance processName='{processName}' id={processId}.", exception);
+            logger.Error($"Could not stop previous HsWin instance processName='{instance.Name}' id={instance.Id}.", exception);
             return false;
         }
     }
+
+    private sealed record PreviousInstance(Process Process, string Name, int Id);
 
     private static string TryGetProcessName(Process process)
     {

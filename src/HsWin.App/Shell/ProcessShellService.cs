@@ -13,7 +13,7 @@ internal sealed class ProcessShellService : IShellService
         _logger = logger;
     }
 
-    public ShellExecutionResult Execute(string command, ShellExecutionOptions options)
+    public ShellExecutionResult Execute(string command, ShellExecutionOptions options, CancellationToken cancellationToken = default)
     {
         try
         {
@@ -27,21 +27,25 @@ internal sealed class ProcessShellService : IShellService
                 return new ShellExecutionResult(command, false, null, string.Empty, "Process did not start.", TimedOut: false);
             }
 
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errorTask = process.StandardError.ReadToEndAsync();
-            if (!process.WaitForExit(options.TimeoutMs))
+            var outputTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            var errorTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+            var outcome = WaitForExit(process, options.TimeoutMs, cancellationToken);
+            if (outcome != WaitOutcome.Exited)
             {
-                KillTimedOutProcess(process);
-                var timedOutOutput = outputTask.GetAwaiter().GetResult();
-                var timedOutError = errorTask.GetAwaiter().GetResult();
-                _logger.Warning($"Command timed out command={LogSanitizer.DescribeCommand(command)} timeoutMs={options.TimeoutMs}.");
-                return new ShellExecutionResult(command, false, null, timedOutOutput, timedOutError, TimedOut: true);
+                // cmd.exe is our own child here, so its whole tree is ours to end.
+                KillProcessTree(process);
+                var partialOutput = outputTask.GetAwaiter().GetResult();
+                var partialError = errorTask.GetAwaiter().GetResult();
+                var timedOut = outcome == WaitOutcome.TimedOut;
+                _logger.Warning(timedOut
+                    ? $"Command timed out command={LogSanitizer.DescribeCommand(command)} timeoutMs={options.TimeoutMs}."
+                    : $"Command cancelled command={LogSanitizer.DescribeCommand(command)}.");
+                return new ShellExecutionResult(command, false, null, partialOutput, partialError, TimedOut: timedOut, Cancelled: !timedOut);
             }
 
             var output = outputTask.GetAwaiter().GetResult();
             var error = errorTask.GetAwaiter().GetResult();
             var success = process.ExitCode == 0;
-            _logger.Info($"Command completed command={LogSanitizer.DescribeCommand(command)} exitCode={process.ExitCode} success={success}.");
             return new ShellExecutionResult(command, success, process.ExitCode, output, error, TimedOut: false);
         }
         catch (Exception exception)
@@ -64,13 +68,11 @@ internal sealed class ProcessShellService : IShellService
             };
 
             using var process = Process.Start(startInfo);
-            var processId = process?.Id;
-            _logger.Info($"Launch completed target='{target}' processId={processId?.ToString() ?? "null"}.");
-            return new LaunchResult(target, Success: true, processId, Error: null);
+            return new LaunchResult(target, Success: true, process?.Id, Error: null);
         }
         catch (Exception exception)
         {
-            _logger.Error($"Launch failed target='{target}'.", exception);
+            _logger.Error($"Launch failed target='{LogSanitizer.DescribeTarget(target)}'.", exception);
             return new LaunchResult(target, Success: false, ProcessId: null, exception.Message);
         }
     }
@@ -93,7 +95,40 @@ internal sealed class ProcessShellService : IShellService
         return startInfo;
     }
 
-    private static void KillTimedOutProcess(Process process)
+    private static WaitOutcome WaitForExit(Process process, int timeoutMs, CancellationToken cancellationToken)
+    {
+        // A task source rather than a wait handle: killing the process after a timeout or cancel
+        // still raises Exited on a thread-pool thread, and that must not touch a disposed handle.
+        var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        process.EnableRaisingEvents = true;
+        process.Exited += (_, _) => exited.TrySetResult();
+        if (process.HasExited)
+        {
+            return WaitOutcome.Exited;
+        }
+
+        var cancelled = false;
+        var signalled = false;
+        try
+        {
+            signalled = exited.Task.Wait(timeoutMs, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            cancelled = true;
+        }
+
+        if (signalled || process.HasExited)
+        {
+            // Let the redirected streams finish before the caller reads them.
+            process.WaitForExit();
+            return WaitOutcome.Exited;
+        }
+
+        return cancelled ? WaitOutcome.Cancelled : WaitOutcome.TimedOut;
+    }
+
+    private static void KillProcessTree(Process process)
     {
         try
         {
@@ -101,6 +136,14 @@ internal sealed class ProcessShellService : IShellService
         }
         catch (InvalidOperationException)
         {
+            // Exited on its own in the meantime.
         }
+    }
+
+    private enum WaitOutcome
+    {
+        Exited,
+        TimedOut,
+        Cancelled
     }
 }

@@ -24,11 +24,8 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(callback);
 
-        var device = ResolveInputDevice(options.DeviceId);
         var path = ResolveRecordingPath(options);
-        var session = new NativeAudioRecordingSession(device, path, options, callback, _logger);
-        session.Start();
-        return session;
+        return StartOrDispose(new NativeAudioRecordingSession(ResolveInputDevice(options.DeviceId), path, options, callback, _logger));
     }
 
     public IDisposable WatchLevels(AudioLevelWatchOptions options, Action<AudioCaptureEvent> callback)
@@ -36,10 +33,22 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(callback);
 
-        var device = ResolveInputDevice(options.DeviceId);
-        var watch = new NativeAudioLevelWatch(device, options, callback, _logger);
-        watch.Start();
-        return watch;
+        return StartOrDispose(new NativeAudioLevelWatch(ResolveInputDevice(options.DeviceId), options, callback, _logger));
+    }
+
+    private static T StartOrDispose<T>(T capture) where T : NativeAudioCaptureBase
+    {
+        try
+        {
+            capture.Start();
+            return capture;
+        }
+        catch
+        {
+            // A device that refuses to start must not leave the endpoint, writer or timer behind.
+            capture.Dispose();
+            throw;
+        }
     }
 
     private static MMDevice ResolveInputDevice(string? deviceId)
@@ -53,7 +62,7 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
     private string ResolveRecordingPath(AudioRecordingOptions options)
     {
         var path = string.IsNullOrWhiteSpace(options.Path)
-            ? Path.Combine(_recordingDirectory, $"recording-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.{GetDefaultExtension(options.Format)}")
+            ? Path.Combine(_recordingDirectory, $"recording-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.{options.Format.ToFileExtension()}")
             : Environment.ExpandEnvironmentVariables(options.Path);
 
         path = Path.GetFullPath(path);
@@ -83,25 +92,13 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
         throw new IOException($"Could not find an unused recording path near '{path}'.");
     }
 
-    private static string GetDefaultExtension(AudioRecordingFormat format)
-    {
-        return format switch
-        {
-            AudioRecordingFormat.Wav => "wav",
-            AudioRecordingFormat.Mp3 => "mp3",
-            AudioRecordingFormat.Aac => "m4a",
-            _ => "wav"
-        };
-    }
-
     private abstract class NativeAudioCaptureBase : IDisposable
     {
         private readonly Action<AudioCaptureEvent> _callback;
         private readonly int _levelIntervalMs;
-        private long _sampleCount;
-        private double _sumSquares;
-        private double _peak;
+        private AudioLevelStats _pendingLevels = AudioLevelStats.Empty;
         private long _lastLevelTick;
+        private int _disposed;
 
         protected NativeAudioCaptureBase(
             MMDevice device,
@@ -110,6 +107,8 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
             IRuntimeLogger logger)
         {
             Device = device;
+            DeviceId = device.ID;
+            DeviceName = device.FriendlyName;
             _levelIntervalMs = levelIntervalMs;
             _callback = callback;
             Logger = logger;
@@ -117,34 +116,58 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
 
         protected MMDevice Device { get; }
 
+        // Cached so events raised on the capture thread never touch a disposed COM endpoint.
+        protected string DeviceId { get; }
+
+        protected string DeviceName { get; }
+
         protected WasapiCapture? Capture { get; private set; }
+
+        protected WaveFormat? Format { get; private set; }
 
         protected IRuntimeLogger Logger { get; }
 
         protected Stopwatch Stopwatch { get; } = new();
 
-        public virtual void Start()
+        protected bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+        public void Start()
         {
-            Capture = new WasapiCapture(Device);
+            Capture = CreateCaptureWithoutSynchronizationContext(Device);
+            Format = Capture.WaveFormat;
             Capture.DataAvailable += OnDataAvailable;
             Capture.RecordingStopped += OnRecordingStopped;
+            OnCaptureReady(Capture);
             Stopwatch.Start();
             _lastLevelTick = Stopwatch.ElapsedMilliseconds;
-            OnCaptureReady(Capture);
-            Emit(new AudioCaptureEvent(
-                "started",
-                Device.ID,
-                Device.FriendlyName,
-                SampleRate: Capture.WaveFormat.SampleRate,
-                Channels: Capture.WaveFormat.Channels));
             Capture.StartRecording();
+            OnStarted();
+            Emit(new AudioCaptureEvent(
+                AudioCaptureEvent.Started,
+                DeviceId,
+                DeviceName,
+                SampleRate: Format.SampleRate,
+                Channels: Format.Channels));
         }
 
-        public virtual void Dispose()
+        public void Dispose()
         {
-            StopCapture();
-            Capture?.Dispose();
-            Device.Dispose();
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                OnDisposing();
+                StopCapture();
+            }
+            finally
+            {
+                Capture?.Dispose();
+                Device.Dispose();
+                OnDisposed();
+            }
         }
 
         protected void StopCapture()
@@ -176,8 +199,38 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
         {
         }
 
+        protected virtual void OnStarted()
+        {
+        }
+
+        protected virtual void OnDisposing()
+        {
+        }
+
+        protected virtual void OnDisposed()
+        {
+        }
+
         protected virtual void HandleRecordingStopped(Exception? exception)
         {
+        }
+
+        /// <summary>
+        /// NAudio raises RecordingStopped on the SynchronizationContext captured at construction.
+        /// Started from a hotkey that is the UI thread, which would run MP3/AAC encoding there.
+        /// </summary>
+        private static WasapiCapture CreateCaptureWithoutSynchronizationContext(MMDevice device)
+        {
+            var previous = SynchronizationContext.Current;
+            SynchronizationContext.SetSynchronizationContext(null);
+            try
+            {
+                return new WasapiCapture(device);
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(previous);
+            }
         }
 
         private void OnDataAvailable(object? sender, WaveInEventArgs eventArgs)
@@ -191,9 +244,9 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
             {
                 Logger.Error("Audio capture data handling failed.", exception);
                 Emit(new AudioCaptureEvent(
-                    "error",
-                    Device.ID,
-                    Device.FriendlyName,
+                    AudioCaptureEvent.Error,
+                    DeviceId,
+                    DeviceName,
                     DurationMs: Stopwatch.Elapsed.TotalMilliseconds,
                     ErrorCode: "capture_failed",
                     Message: exception.Message));
@@ -215,52 +268,45 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
 
         private void MaybeEmitLevel(byte[] buffer, int bytesRecorded)
         {
-            if (_levelIntervalMs <= 0 || Capture is null)
+            if (_levelIntervalMs <= 0 || Format is null)
             {
                 return;
             }
 
-            var levels = AudioLevelCalculator.Calculate(buffer, bytesRecorded, Capture.WaveFormat);
-            if (levels.SampleCount > 0)
-            {
-                _sampleCount += levels.SampleCount;
-                _sumSquares += levels.SumSquares;
-                _peak = Math.Max(_peak, levels.Peak);
-            }
-
+            _pendingLevels = _pendingLevels.Merge(AudioLevelCalculator.Calculate(buffer, bytesRecorded, Format));
             var elapsedMs = Stopwatch.ElapsedMilliseconds;
             if (elapsedMs - _lastLevelTick < _levelIntervalMs)
             {
                 return;
             }
 
-            var rms = _sampleCount == 0 ? 0 : Math.Sqrt(_sumSquares / _sampleCount);
             Emit(new AudioCaptureEvent(
-                "level",
-                Device.ID,
-                Device.FriendlyName,
-                SampleRate: Capture.WaveFormat.SampleRate,
-                Channels: Capture.WaveFormat.Channels,
+                AudioCaptureEvent.Level,
+                DeviceId,
+                DeviceName,
+                SampleRate: Format.SampleRate,
+                Channels: Format.Channels,
                 DurationMs: Stopwatch.Elapsed.TotalMilliseconds,
-                Peak: Math.Round(_peak, 4),
-                Rms: Math.Round(rms, 4)));
+                Peak: Math.Round(_pendingLevels.Peak, 4),
+                Rms: Math.Round(_pendingLevels.Rms, 4)));
 
-            _sampleCount = 0;
-            _sumSquares = 0;
-            _peak = 0;
+            _pendingLevels = AudioLevelStats.Empty;
             _lastLevelTick = elapsedMs;
         }
     }
 
     private sealed class NativeAudioRecordingSession : NativeAudioCaptureBase, IAudioRecordingSession
     {
+        /// <summary>A canonical PCM WAV header; a file this small never captured audio.</summary>
+        private const int WavHeaderBytes = 44;
+
         private readonly AudioRecordingOptions _options;
         private readonly object _gate = new();
-        private readonly System.Threading.Timer? _stopTimer;
+        private System.Threading.Timer? _stopTimer;
         private WaveFileWriter? _writer;
         private string? _workingPath;
         private int _stopped;
-        private int _disposed;
+        private int _finalized;
 
         public NativeAudioRecordingSession(
             MMDevice device,
@@ -272,26 +318,11 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
         {
             Path = path;
             _options = options;
-            if (options.MaxDurationMs is { } maxDurationMs)
-            {
-                _stopTimer = new System.Threading.Timer(_ => Stop(), null, maxDurationMs, Timeout.Infinite);
-            }
         }
 
         public string Path { get; }
 
         public bool IsRecording => Volatile.Read(ref _stopped) == 0;
-
-        protected override void OnCaptureReady(WasapiCapture capture)
-        {
-            _workingPath = _options.Format == AudioRecordingFormat.Wav
-                ? Path
-                : System.IO.Path.Combine(
-                    System.IO.Path.GetDirectoryName(Path)!,
-                    $".{System.IO.Path.GetFileNameWithoutExtension(Path)}-{Guid.NewGuid():N}.wav");
-            _writer = new WaveFileWriter(_workingPath, capture.WaveFormat);
-            Logger.Info($"Audio recording started path='{Path}' workingPath='{_workingPath}' device='{Device.FriendlyName}'.");
-        }
 
         public void Stop()
         {
@@ -303,16 +334,44 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
             StopCapture();
         }
 
-        public override void Dispose()
+        protected override void OnCaptureReady(WasapiCapture capture)
         {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            _workingPath = _options.Format == AudioRecordingFormat.Wav
+                ? Path
+                : System.IO.Path.Combine(
+                    System.IO.Path.GetDirectoryName(Path)!,
+                    $".{System.IO.Path.GetFileNameWithoutExtension(Path)}-{Guid.NewGuid():N}.wav");
+            _writer = new WaveFileWriter(_workingPath, capture.WaveFormat);
+            Logger.Info($"Audio recording started format='{_options.Format.ToFileExtension()}'.");
+        }
+
+        protected override void OnStarted()
+        {
+            // Arm the limit only once capture really runs, so a failed start leaves no timer.
+            if (_options.MaxDurationMs is { } maxDurationMs)
+            {
+                _stopTimer = new System.Threading.Timer(_ => Stop(), null, maxDurationMs, Timeout.Infinite);
+            }
+        }
+
+        protected override void OnDisposing()
+        {
+            Interlocked.Exchange(ref _stopped, 1);
+            _stopTimer?.Dispose();
+        }
+
+        protected override void OnDisposed()
+        {
+            // Disposed before capture stopped normally (or before it ever started): release the
+            // file handle and drop intermediate or header-only files.
+            if (Interlocked.Exchange(ref _finalized, 1) != 0)
             {
                 return;
             }
 
-            Stop();
-            _stopTimer?.Dispose();
-            base.Dispose();
+            CloseWriter();
+            DeleteTemporaryWorkingFile();
+            DeleteIfHeaderOnly(Path);
         }
 
         protected override void HandleAudioData(byte[] buffer, int bytesRecorded)
@@ -325,66 +384,71 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
 
         protected override void HandleRecordingStopped(Exception? exception)
         {
+            if (Interlocked.Exchange(ref _finalized, 1) != 0)
+            {
+                return;
+            }
+
             Interlocked.Exchange(ref _stopped, 1);
             _stopTimer?.Dispose();
-
+            var reason = "stopped";
             try
             {
-                lock (_gate)
-                {
-                    _writer?.Dispose();
-                    _writer = null;
-                }
-
+                CloseWriter();
                 if (exception is not null)
                 {
-                    Emit(new AudioCaptureEvent(
-                        "error",
-                        Device.ID,
-                        Device.FriendlyName,
-                        Path,
-                        Format: FormatName(_options.Format),
-                        DurationMs: Stopwatch.Elapsed.TotalMilliseconds,
-                        ErrorCode: "capture_failed",
-                        Message: exception.Message));
-                    return;
+                    reason = "error";
+                    EmitError("capture_failed", exception.Message);
                 }
-
-                if (_options.Format is AudioRecordingFormat.Mp3 or AudioRecordingFormat.Aac)
+                else if (_options.Format is AudioRecordingFormat.Mp3 or AudioRecordingFormat.Aac)
                 {
                     EncodeRecording();
                 }
-
-                var bytes = File.Exists(Path) ? new FileInfo(Path).Length : 0;
-                Logger.Info($"Audio recording stopped path='{Path}' bytes={bytes} durationMs={Stopwatch.Elapsed.TotalMilliseconds:F3}.");
-                Emit(new AudioCaptureEvent(
-                    "stopped",
-                    Device.ID,
-                    Device.FriendlyName,
-                    Path,
-                    FormatName(_options.Format),
-                    Capture?.WaveFormat.SampleRate,
-                    Capture?.WaveFormat.Channels,
-                    bytes,
-                    Stopwatch.Elapsed.TotalMilliseconds,
-                    Reason: "stopped"));
             }
-            catch (Exception encodeException)
+            catch (Exception finalizeException)
             {
-                Logger.Error("Audio recording finalization failed.", encodeException);
-                Emit(new AudioCaptureEvent(
-                    "error",
-                    Device.ID,
-                    Device.FriendlyName,
-                    Path,
-                    Format: FormatName(_options.Format),
-                    DurationMs: Stopwatch.Elapsed.TotalMilliseconds,
-                    ErrorCode: "finalize_failed",
-                    Message: encodeException.Message));
+                reason = "error";
+                Logger.Error("Audio recording finalization failed.", finalizeException);
+                EmitError("finalize_failed", finalizeException.Message);
             }
             finally
             {
                 DeleteTemporaryWorkingFile();
+                var bytes = File.Exists(Path) ? new FileInfo(Path).Length : 0;
+                Logger.Info($"Audio recording stopped reason='{reason}' bytes={bytes} durationMs={Stopwatch.Elapsed.TotalMilliseconds:F3}.");
+                Emit(new AudioCaptureEvent(
+                    AudioCaptureEvent.Stopped,
+                    DeviceId,
+                    DeviceName,
+                    Path,
+                    _options.Format.ToFileExtension(),
+                    Format?.SampleRate,
+                    Format?.Channels,
+                    bytes,
+                    Stopwatch.Elapsed.TotalMilliseconds,
+                    Reason: reason));
+            }
+        }
+
+        private void EmitError(string errorCode, string message)
+        {
+            Emit(new AudioCaptureEvent(
+                AudioCaptureEvent.Error,
+                DeviceId,
+                DeviceName,
+                Path,
+                Format: _options.Format.ToFileExtension(),
+                DurationMs: Stopwatch.Elapsed.TotalMilliseconds,
+                ErrorCode: errorCode,
+                Message: message));
+        }
+
+        private void CloseWriter()
+        {
+            lock (_gate)
+            {
+                _writer?.Dispose();
+                _writer = null;
             }
         }
 
@@ -414,14 +478,25 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
 
         private void DeleteTemporaryWorkingFile()
         {
-            if (_options.Format == AudioRecordingFormat.Wav || string.IsNullOrWhiteSpace(_workingPath))
+            if (_options.Format != AudioRecordingFormat.Wav && !string.IsNullOrWhiteSpace(_workingPath))
             {
-                return;
+                TryDelete(_workingPath);
             }
+        }
 
+        private static void DeleteIfHeaderOnly(string path)
+        {
+            if (File.Exists(path) && new FileInfo(path).Length <= WavHeaderBytes)
+            {
+                TryDelete(path);
+            }
+        }
+
+        private static void TryDelete(string path)
+        {
             try
             {
-                File.Delete(_workingPath);
+                File.Delete(path);
             }
             catch (IOException)
             {
@@ -434,8 +509,6 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
 
     private sealed class NativeAudioLevelWatch : NativeAudioCaptureBase
     {
-        private int _disposed;
-
         public NativeAudioLevelWatch(
             MMDevice device,
             AudioLevelWatchOptions options,
@@ -445,146 +518,22 @@ internal sealed class NativeAudioCaptureService : IAudioCaptureService
         {
         }
 
-        public override void Dispose()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
-            {
-                return;
-            }
-
-            StopCapture();
-            base.Dispose();
-        }
-
         protected override void HandleAudioData(byte[] buffer, int bytesRecorded)
         {
         }
 
         protected override void HandleRecordingStopped(Exception? exception)
         {
-            if (exception is not null)
+            if (exception is not null && !IsDisposed)
             {
                 Emit(new AudioCaptureEvent(
-                    "error",
-                    Device.ID,
-                    Device.FriendlyName,
+                    AudioCaptureEvent.Error,
+                    DeviceId,
+                    DeviceName,
                     DurationMs: Stopwatch.Elapsed.TotalMilliseconds,
                     ErrorCode: "levels_failed",
                     Message: exception.Message));
             }
-        }
-    }
-
-    private static string FormatName(AudioRecordingFormat format)
-    {
-        return format switch
-        {
-            AudioRecordingFormat.Wav => "wav",
-            AudioRecordingFormat.Mp3 => "mp3",
-            AudioRecordingFormat.Aac => "m4a",
-            _ => "wav"
-        };
-    }
-
-    private static class AudioLevelCalculator
-    {
-        public static AudioLevelStats Calculate(byte[] buffer, int bytesRecorded, WaveFormat waveFormat)
-        {
-            return waveFormat.Encoding switch
-            {
-                WaveFormatEncoding.IeeeFloat when waveFormat.BitsPerSample == 32 => CalculateFloat32(buffer, bytesRecorded),
-                WaveFormatEncoding.Pcm when waveFormat.BitsPerSample == 16 => CalculatePcm16(buffer, bytesRecorded),
-                WaveFormatEncoding.Pcm when waveFormat.BitsPerSample == 24 => CalculatePcm24(buffer, bytesRecorded),
-                WaveFormatEncoding.Pcm when waveFormat.BitsPerSample == 32 => CalculatePcm32(buffer, bytesRecorded),
-                WaveFormatEncoding.Pcm when waveFormat.BitsPerSample == 8 => CalculatePcm8(buffer, bytesRecorded),
-                _ => AudioLevelStats.Empty
-            };
-        }
-
-        private static AudioLevelStats CalculateFloat32(byte[] buffer, int bytesRecorded)
-        {
-            var count = bytesRecorded / sizeof(float);
-            var stats = AudioLevelStats.Empty;
-            for (var index = 0; index < count; index++)
-            {
-                stats = stats.AddSample(BitConverter.ToSingle(buffer, index * sizeof(float)));
-            }
-
-            return stats;
-        }
-
-        private static AudioLevelStats CalculatePcm16(byte[] buffer, int bytesRecorded)
-        {
-            var count = bytesRecorded / sizeof(short);
-            var stats = AudioLevelStats.Empty;
-            for (var index = 0; index < count; index++)
-            {
-                stats = stats.AddSample(BitConverter.ToInt16(buffer, index * sizeof(short)) / 32768.0);
-            }
-
-            return stats;
-        }
-
-        private static AudioLevelStats CalculatePcm24(byte[] buffer, int bytesRecorded)
-        {
-            var count = bytesRecorded / 3;
-            var stats = AudioLevelStats.Empty;
-            for (var index = 0; index < count; index++)
-            {
-                var offset = index * 3;
-                var value = buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
-                if ((value & 0x800000) != 0)
-                {
-                    value |= unchecked((int)0xFF000000);
-                }
-
-                stats = stats.AddSample(value / 8388608.0);
-            }
-
-            return stats;
-        }
-
-        private static AudioLevelStats CalculatePcm32(byte[] buffer, int bytesRecorded)
-        {
-            var count = bytesRecorded / sizeof(int);
-            var stats = AudioLevelStats.Empty;
-            for (var index = 0; index < count; index++)
-            {
-                stats = stats.AddSample(BitConverter.ToInt32(buffer, index * sizeof(int)) / 2147483648.0);
-            }
-
-            return stats;
-        }
-
-        private static AudioLevelStats CalculatePcm8(byte[] buffer, int bytesRecorded)
-        {
-            var stats = AudioLevelStats.Empty;
-            for (var index = 0; index < bytesRecorded; index++)
-            {
-                stats = stats.AddSample((buffer[index] - 128) / 128.0);
-            }
-
-            return stats;
-        }
-    }
-
-    private readonly record struct AudioLevelStats(long SampleCount, double SumSquares, double Peak)
-    {
-        public static AudioLevelStats Empty { get; } = new(0, 0, 0);
-
-        public AudioLevelStats AddSample(double sample)
-        {
-            if (double.IsNaN(sample) || double.IsInfinity(sample))
-            {
-                return this;
-            }
-
-            var clamped = Math.Clamp(sample, -1, 1);
-            var absolute = Math.Abs(clamped);
-            return new AudioLevelStats(
-                SampleCount + 1,
-                SumSquares + (clamped * clamped),
-                Math.Max(Peak, absolute));
         }
     }
 }

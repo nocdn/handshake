@@ -1,3 +1,5 @@
+using HsWin.Core.Input;
+
 namespace HsWin.Core.Mouse;
 
 public sealed class NullMouseInputService : IMouseInputService
@@ -12,25 +14,12 @@ public sealed class NullMouseInputService : IMouseInputService
     {
     }
 
-    public IMouseRepeatSession Repeat(MouseButton button, MouseRepeatOptions options)
+    public IRepeatSession Repeat(MouseButton button, MouseRepeatOptions options)
     {
-        return new NullRepeatSession();
+        return new NullRepeatSession(options.IntervalMs);
     }
 
     public void StopActiveRepeat()
     {
-    }
-
-    private sealed class NullRepeatSession : IMouseRepeatSession
-    {
-        public int IntervalMs => MouseRepeatOptions.DefaultIntervalMs;
-
-        public void SetIntervalMs(int intervalMs)
-        {
-        }
-
-        public void Dispose()
-        {
-        }
     }
 }

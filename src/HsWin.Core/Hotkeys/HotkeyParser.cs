@@ -1,5 +1,8 @@
 using System.Collections;
 using System.Globalization;
+using HsWin.Core.Keyboard;
+using HsWin.Core.Mouse;
+using HsWin.Core.Scripting;
 using Microsoft.ClearScript;
 
 namespace HsWin.Core.Hotkeys;
@@ -20,94 +23,6 @@ public static class HotkeyParser
             ["win"] = HotkeyModifiers.Win,
             ["windows"] = HotkeyModifiers.Win,
             ["meta"] = HotkeyModifiers.Win
-        };
-
-    private static readonly IReadOnlyDictionary<string, uint> NamedKeys =
-        new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["backspace"] = 0x08,
-            ["delete"] = 0x2E,
-            ["del"] = 0x2E,
-            ["tab"] = 0x09,
-            ["enter"] = 0x0D,
-            ["return"] = 0x0D,
-            ["escape"] = 0x1B,
-            ["esc"] = 0x1B,
-            ["space"] = 0x20,
-            ["pageup"] = 0x21,
-            ["pagedown"] = 0x22,
-            ["home"] = 0x24,
-            ["end"] = 0x23,
-            ["left"] = 0x25,
-            ["up"] = 0x26,
-            ["right"] = 0x27,
-            ["down"] = 0x28,
-            ["insert"] = 0x2D,
-            ["ins"] = 0x2D,
-            ["plus"] = 0xBB,
-            ["minus"] = 0xBD,
-            ["comma"] = 0xBC,
-            ["period"] = 0xBE,
-            ["dot"] = 0xBE,
-            ["slash"] = 0xBF,
-            ["semicolon"] = 0xBA,
-            ["quote"] = 0xDE,
-            ["backquote"] = 0xC0,
-            ["grave"] = 0xC0,
-            ["leftbracket"] = 0xDB,
-            ["rightbracket"] = 0xDD,
-            ["backslash"] = 0xDC,
-            ["shift"] = 0x10,
-            ["control"] = 0x11,
-            ["ctrl"] = 0x11
-        };
-
-    private static readonly IReadOnlyDictionary<string, HotkeyMouseButton> MouseButtonAliases =
-        new Dictionary<string, HotkeyMouseButton>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["middle"] = HotkeyMouseButton.Middle,
-            ["middlemouse"] = HotkeyMouseButton.Middle,
-            ["mouse.middle"] = HotkeyMouseButton.Middle,
-            ["mouse.button3"] = HotkeyMouseButton.Middle,
-            ["mousebutton3"] = HotkeyMouseButton.Middle,
-            ["button3"] = HotkeyMouseButton.Middle,
-
-            ["back"] = HotkeyMouseButton.XButton1,
-            ["backward"] = HotkeyMouseButton.XButton1,
-            ["thumb1"] = HotkeyMouseButton.XButton1,
-            ["xbutton1"] = HotkeyMouseButton.XButton1,
-            ["mouse.back"] = HotkeyMouseButton.XButton1,
-            ["mouse.backward"] = HotkeyMouseButton.XButton1,
-            ["mouse.xbutton1"] = HotkeyMouseButton.XButton1,
-            ["mouse.button4"] = HotkeyMouseButton.XButton1,
-            ["mousebutton4"] = HotkeyMouseButton.XButton1,
-            ["button4"] = HotkeyMouseButton.XButton1,
-
-            ["forward"] = HotkeyMouseButton.XButton2,
-            ["thumb2"] = HotkeyMouseButton.XButton2,
-            ["xbutton2"] = HotkeyMouseButton.XButton2,
-            ["mouse.forward"] = HotkeyMouseButton.XButton2,
-            ["mouse.xbutton2"] = HotkeyMouseButton.XButton2,
-            ["mouse.button5"] = HotkeyMouseButton.XButton2,
-            ["mousebutton5"] = HotkeyMouseButton.XButton2,
-            ["button5"] = HotkeyMouseButton.XButton2
-        };
-
-    private static readonly IReadOnlyDictionary<char, uint> SingleCharacterKeys =
-        new Dictionary<char, uint>
-        {
-            ['`'] = 0xC0,
-            ['~'] = 0xC0,
-            ['-'] = 0xBD,
-            ['='] = 0xBB,
-            [','] = 0xBC,
-            ['.'] = 0xBE,
-            ['/'] = 0xBF,
-            [';'] = 0xBA,
-            ['\''] = 0xDE,
-            ['['] = 0xDB,
-            [']'] = 0xDD,
-            ['\\'] = 0xDC
         };
 
     public static HotkeyDefinition Parse(object? modifiers, object? key)
@@ -172,34 +87,9 @@ public static class HotkeyParser
             throw new ArgumentException($"Mouse hotkey key '{key}' does not have a virtual-key code.", nameof(value));
         }
 
-        if (key.Length == 1)
-        {
-            var character = char.ToUpperInvariant(key[0]);
-            if (character is >= 'A' and <= 'Z')
-            {
-                return character;
-            }
-
-            if (character is >= '0' and <= '9')
-            {
-                return character;
-            }
-
-            if (SingleCharacterKeys.TryGetValue(key[0], out var singleCharacterVirtualKey))
-            {
-                return singleCharacterVirtualKey;
-            }
-        }
-
-        if (key.StartsWith('F') && int.TryParse(key[1..], NumberStyles.None, CultureInfo.InvariantCulture, out var functionKey))
-        {
-            if (functionKey is >= 1 and <= 24)
-            {
-                return (uint)(0x70 + functionKey - 1);
-            }
-        }
-
-        if (NamedKeys.TryGetValue(NormalizeKeyName(key), out var virtualKey))
+        // Exact names first so punctuation names such as "-" or "pad-" survive normalization.
+        if (KeyboardKeyRules.TryParseKeyName(key, out var virtualKey)
+            || KeyboardKeyRules.TryParseKeyName(NormalizeKeyName(key), out virtualKey))
         {
             return virtualKey;
         }
@@ -225,42 +115,43 @@ public static class HotkeyParser
         return !string.IsNullOrWhiteSpace(key) && TryParseMouseButtonName(key, out mouseButton);
     }
 
+    /// <summary>
+    /// Only the middle and side buttons can be hotkeys; "left" and "right" stay arrow-key names.
+    /// </summary>
     private static bool TryParseMouseButtonName(string key, out HotkeyMouseButton mouseButton)
     {
-        return MouseButtonAliases.TryGetValue(NormalizeMouseButtonName(key), out mouseButton);
+        mouseButton = default;
+        if (!MouseButtonParser.TryParse(key, out var button))
+        {
+            return false;
+        }
+
+        switch (button)
+        {
+            case MouseButton.Middle:
+                mouseButton = HotkeyMouseButton.Middle;
+                return true;
+            case MouseButton.XButton1:
+                mouseButton = HotkeyMouseButton.XButton1;
+                return true;
+            case MouseButton.XButton2:
+                mouseButton = HotkeyMouseButton.XButton2;
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static IEnumerable<object?> EnumerateModifierValues(object? value)
     {
-        if (value is null || ReferenceEquals(value, Undefined.Value))
-        {
-            yield break;
-        }
-
         if (value is string singleModifier)
         {
-            yield return singleModifier;
-            yield break;
+            return [singleModifier];
         }
 
-        if (value is ScriptObject scriptObject)
+        if (ScriptArgumentReader.IsMissing(value) || value is ScriptObject or IEnumerable)
         {
-            foreach (var index in scriptObject.PropertyIndices.Order())
-            {
-                yield return scriptObject.GetProperty(index);
-            }
-
-            yield break;
-        }
-
-        if (value is IEnumerable enumerable)
-        {
-            foreach (var item in enumerable)
-            {
-                yield return item;
-            }
-
-            yield break;
+            return ScriptArgumentReader.EnumerateIndexedValues(value);
         }
 
         throw new ArgumentException("Hotkey modifiers must be a string or an array.", nameof(value));
@@ -293,10 +184,5 @@ public static class HotkeyParser
             .Replace("_", string.Empty, StringComparison.Ordinal)
             .Replace("-", string.Empty, StringComparison.Ordinal)
             .ToLowerInvariant();
-    }
-
-    private static string NormalizeMouseButtonName(string value)
-    {
-        return NormalizeKeyName(value);
     }
 }

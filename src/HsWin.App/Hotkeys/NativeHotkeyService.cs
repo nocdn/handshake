@@ -2,7 +2,6 @@ using HsWin.Core.Hotkeys;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Windows.Threading;
@@ -14,15 +13,24 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
     private const int MaximumApplicationHotkeyId = 0xBFFF;
     private const int FirstHotkeyId = 1;
     private const int WmHotkey = 0x0312;
+
+    /// <summary><c>MOD_NOREPEAT</c>: a held hotkey fires once, not on every key repeat.</summary>
+    private const uint ModNoRepeat = 0x4000;
     private const int ErrorHotkeyAlreadyRegistered = 1409;
     private static readonly IntPtr HwndMessage = new(-3);
 
     private readonly MessageWindow _window;
     private readonly IRuntimeLogger _logger;
     private readonly NativeMouseHotkeyHook _mouseHotkeys;
+    private readonly bool _ownsMouseHotkeys;
     private readonly IHotkeyThreadInvoker _threadInvoker;
     private readonly IHotkeyPlatform _platform;
     private readonly Dictionary<int, Action> _callbacks = [];
+    private readonly object _callbackGate = new();
+
+    // IDs still registered with Windows. Owner thread only: native register and unregister both
+    // run there, and an ID is reusable only once its native unregister has completed.
+    private readonly HashSet<int> _nativeIds = [];
     private int _nextId = FirstHotkeyId;
     private bool _disposed;
 
@@ -36,24 +44,25 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
     {
     }
 
-    public NativeHotkeyService(IRuntimeLogger logger, IKeyboardEventService keyboardEvents)
+    /// <summary>
+    /// Registers button hotkeys on <paramref name="mouseHotkeys"/>, the shared WH_MOUSE_LL host the
+    /// caller also hands to the scroll-watch service. The caller keeps ownership and disposes it.
+    /// </summary>
+    public NativeHotkeyService(IRuntimeLogger logger, NativeMouseHotkeyHook mouseHotkeys)
         : this(
             logger,
             new DispatcherHotkeyThreadInvoker(Dispatcher.CurrentDispatcher),
             NativeHotkeyPlatform.Instance,
-            new NativeMouseHotkeyHook(
-                logger,
-                Win32MouseHookPlatform.Instance,
-                SynchronizationContext.Current,
-                keyboardEvents: keyboardEvents))
+            mouseHotkeys)
     {
     }
 
+    /// <summary>Creates, and later disposes, its own mouse hook.</summary>
     internal NativeHotkeyService(
         IRuntimeLogger logger,
         IHotkeyThreadInvoker threadInvoker,
         IHotkeyPlatform platform)
-        : this(logger, threadInvoker, platform, mouseHotkeys: null)
+        : this(logger, threadInvoker, platform, new NativeMouseHotkeyHook(logger), ownsMouseHotkeys: true)
     {
     }
 
@@ -61,20 +70,18 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
         IRuntimeLogger logger,
         IHotkeyThreadInvoker threadInvoker,
         IHotkeyPlatform platform,
-        NativeMouseHotkeyHook? mouseHotkeys)
+        NativeMouseHotkeyHook mouseHotkeys,
+        bool ownsMouseHotkeys = false)
     {
+        ArgumentNullException.ThrowIfNull(mouseHotkeys);
         _logger = logger;
         _threadInvoker = threadInvoker;
         _platform = platform;
-        _mouseHotkeys = mouseHotkeys ?? new NativeMouseHotkeyHook(_logger);
+        _mouseHotkeys = mouseHotkeys;
+        _ownsMouseHotkeys = ownsMouseHotkeys;
         _window = new MessageWindow(DispatchHotkey);
         _logger.Info($"Hotkey message window created. HWND=0x{_window.Handle.ToInt64():X}");
     }
-
-    /// <summary>
-    /// Shared low-level mouse hook used for button hotkeys and scroll watches.
-    /// </summary>
-    internal NativeMouseHotkeyHook MouseHook => _mouseHotkeys;
 
     public IDisposable Register(HotkeyDefinition hotkey, Action pressed)
     {
@@ -100,7 +107,9 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
     {
         if (!_threadInvoker.CheckAccess())
         {
-            _threadInvoker.Invoke(DisposeOnOwnerThread);
+            // Teardown must never block a gate-holding reload thread on a wedged
+            // owner thread; disposal is idempotent when it runs late.
+            _threadInvoker.BeginInvoke(DisposeOnOwnerThread);
             return;
         }
 
@@ -119,9 +128,7 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
         }
 
         var id = AllocateId();
-        var modifierFlags = (uint)(hotkey.Modifiers | HotkeyModifiers.NoRepeat);
-        _logger.Info($"Registering hotkey id={id} modifiers=0x{modifierFlags:X} vk=0x{hotkey.VirtualKey:X2}.");
-
+        var modifierFlags = (uint)hotkey.Modifiers | ModNoRepeat;
         if (!_platform.RegisterHotKey(_window.Handle, id, modifierFlags, hotkey.VirtualKey, out var errorCode))
         {
             var message = CreateRegistrationFailureMessage(errorCode, hotkey);
@@ -130,8 +137,13 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
             throw exception;
         }
 
-        _callbacks[id] = pressed;
-        _logger.Info($"Hotkey registered id={id}.");
+        _nativeIds.Add(id);
+        lock (_callbackGate)
+        {
+            _callbacks[id] = pressed;
+        }
+
+        _logger.Info($"Hotkey registered id={id} {hotkey}.");
         return new HotkeyRegistration(this, id);
     }
 
@@ -161,64 +173,89 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
             return;
         }
 
-        foreach (var id in _callbacks.Keys.ToArray())
+        int[] ids;
+        lock (_callbackGate)
+        {
+            ids = [.. _callbacks.Keys];
+        }
+
+        foreach (var id in ids)
         {
             Unregister(id);
         }
 
-        _mouseHotkeys.Dispose();
-        _logger.Info("Mouse hotkey service disposed.");
+        if (_ownsMouseHotkeys)
+        {
+            _mouseHotkeys.Dispose();
+            _logger.Info("Mouse hotkey service disposed.");
+        }
 
         _window.DestroyHandle();
         _logger.Info("Hotkey message window destroyed.");
         _disposed = true;
     }
 
+    /// <summary>
+    /// Hands out IDs round-robin, skipping ones still registered, so reloads never exhaust the
+    /// range and a just-freed ID is not reused while a stale WM_HOTKEY for it may be queued.
+    /// </summary>
     private int AllocateId()
     {
-        if (_nextId > MaximumApplicationHotkeyId)
+        for (var attempt = FirstHotkeyId; attempt <= MaximumApplicationHotkeyId; attempt++)
         {
-            throw new InvalidOperationException("No hotkey registration identifiers are available.");
+            var candidate = _nextId;
+            _nextId = candidate == MaximumApplicationHotkeyId ? FirstHotkeyId : candidate + 1;
+            if (!_nativeIds.Contains(candidate))
+            {
+                return candidate;
+            }
         }
 
-        return _nextId++;
+        throw new InvalidOperationException("No hotkey registration identifiers are available.");
     }
 
-    private void DispatchHotkey(int id)
+    internal void DispatchHotkey(int id)
     {
-        if (_callbacks.TryGetValue(id, out var callback))
+        Action? callback;
+        lock (_callbackGate)
         {
-            var startedAt = Stopwatch.GetTimestamp();
-            _logger.Info($"Hotkey dispatched id={id}.");
-            callback();
-            _logger.Info($"Hotkey callback returned id={id} elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
-            return;
+            _callbacks.TryGetValue(id, out callback);
         }
 
-        _logger.Warning($"Received WM_HOTKEY for unknown id={id}.");
+        // An unknown ID is a press that raced its own unregistration; nothing to run.
+        callback?.Invoke();
     }
 
     private void Unregister(int id)
     {
+        bool removed;
+        lock (_callbackGate)
+        {
+            removed = _callbacks.Remove(id);
+        }
+
+        if (!removed)
+        {
+            return;
+        }
+
         if (!_threadInvoker.CheckAccess())
         {
-            _threadInvoker.Invoke(() => UnregisterOnOwnerThread(id));
+            // Unregister runs during reload disposal while holding the script gate,
+            // so the native call must not wait on a wedged owner thread. The script
+            // callback is already gone, so a late native unregister is harmless.
+            _threadInvoker.BeginInvoke(() => UnregisterNative(id));
             return;
         }
 
-        UnregisterOnOwnerThread(id);
+        UnregisterNative(id);
     }
 
-    private void UnregisterOnOwnerThread(int id)
+    private void UnregisterNative(int id)
     {
-        if (!_callbacks.Remove(id))
-        {
-            return;
-        }
-
+        _nativeIds.Remove(id);
         if (_platform.UnregisterHotKey(_window.Handle, id, out var errorCode))
         {
-            _logger.Info($"Hotkey unregistered id={id}.");
             return;
         }
 
@@ -290,6 +327,8 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
         T Invoke<T>(Func<T> callback);
 
         void Invoke(Action callback);
+
+        void BeginInvoke(Action callback);
     }
 
     private sealed class DispatcherHotkeyThreadInvoker : IHotkeyThreadInvoker
@@ -308,12 +347,33 @@ internal sealed partial class NativeHotkeyService : IHotkeyRegistrar, IDisposabl
 
         public T Invoke<T>(Func<T> callback)
         {
-            return _dispatcher.Invoke(callback);
+            // Register runs during config evaluation while holding the script gate:
+            // fail fast instead of deadlocking on a wedged owner thread.
+            return Threading.DispatcherGuard.InvokeWithTimeout(
+                _dispatcher,
+                callback,
+                "hotkey registration",
+                Threading.DispatcherGuard.MarshalTimeout);
         }
 
         public void Invoke(Action callback)
         {
-            _dispatcher.Invoke(callback);
+            Threading.DispatcherGuard.InvokeWithTimeout<object?>(
+                _dispatcher,
+                () =>
+                {
+                    callback();
+                    return null;
+                },
+                "hotkey registration",
+                Threading.DispatcherGuard.MarshalTimeout);
+        }
+
+        public void BeginInvoke(Action callback)
+        {
+            // Teardown (unregister/dispose) runs during reload disposal while holding
+            // the script gate: never wait on the owner thread.
+            Threading.DispatcherGuard.FireAndForget(_dispatcher, callback, "hotkey teardown");
         }
     }
 

@@ -15,12 +15,19 @@ $projectPath = Join-Path $repoRoot "src\HsWin.App\HsWin.App.csproj"
 $cliProjectPath = Join-Path $repoRoot "src\HsWin.Cli\HsWin.Cli.csproj"
 $installerScriptPath = Join-Path $repoRoot "installer\HsWin.iss"
 $artifactsRoot = Join-Path $repoRoot "artifacts"
-$publishDir = Join-Path $artifactsRoot "publish\HsWin.App\$Configuration\$RuntimeIdentifier"
+$appPublishDir = Join-Path $artifactsRoot "publish\HsWin.App\$Configuration\$RuntimeIdentifier"
+$cliPublishDir = Join-Path $artifactsRoot "publish\HsWin.Cli\$Configuration\$RuntimeIdentifier"
+$stagingDir = Join-Path $artifactsRoot "publish\installer\$Configuration\$RuntimeIdentifier"
 $installerOutputDir = Join-Path $artifactsRoot "installer"
 
+# Releases are numbered by the CI run (Version "31" -> file version 0.0.0.31). Local builds are
+# development builds: file version 0.0.0.0, so they always compare older than any release and
+# installing one over the other is a predictable downgrade or upgrade, never a coin flip.
 if ([string]::IsNullOrWhiteSpace($Version)) {
-    $now = [System.DateTimeOffset]::Now
-    $Version = "0.{0:MMdd}.{0:HHmm}.{0:ss}" -f $now
+    $Version = "0.0.0-dev.{0:yyyyMMddHHmmss}" -f [System.DateTimeOffset]::Now
+    if ([string]::IsNullOrWhiteSpace($VersionInfoVersion)) {
+        $VersionInfoVersion = "0.0.0.0"
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($VersionInfoVersion)) {
@@ -34,7 +41,7 @@ if ([string]::IsNullOrWhiteSpace($VersionInfoVersion)) {
         $VersionInfoVersion = $Version
     }
     else {
-        $VersionInfoVersion = "0.0.0.0"
+        throw "Version '$Version' is not a release number; pass -VersionInfoVersion explicitly."
     }
 }
 
@@ -85,37 +92,85 @@ function Get-InnoSetupCompiler {
     throw "Inno Setup Compiler (ISCC.exe) was not found. Install Inno Setup or set INNO_SETUP_ISCC to the full path of ISCC.exe."
 }
 
-Assert-ChildPath -Parent $repoRoot -Child $publishDir
-Assert-ChildPath -Parent $repoRoot -Child $installerOutputDir
+function Invoke-Publish {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Project,
 
-if (Test-Path -LiteralPath $publishDir) {
-    Remove-Item -LiteralPath $publishDir -Recurse -Force
+        [Parameter(Mandatory = $true)]
+        [string] $Output
+    )
+
+    dotnet publish $Project `
+        --configuration $Configuration `
+        --runtime $RuntimeIdentifier `
+        --self-contained true `
+        --output $Output `
+        -p:PublishSingleFile=false `
+        -p:Version=$Version `
+        -p:AssemblyVersion=$VersionInfoVersion `
+        -p:FileVersion=$VersionInfoVersion `
+        -p:InformationalVersion=$Version
+
+    # $ErrorActionPreference does not apply to native commands.
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet publish failed for '$Project' with exit code $LASTEXITCODE."
+    }
 }
 
-New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
+# The WPF app ships the Windows Desktop runtime, whose copies of these files are complete; the
+# console CLI ships thin facades of the same names. Where they differ, the app's copy must win.
+$desktopRuntimeFiles = @('Microsoft.VisualBasic.dll', 'System.Drawing.dll', 'WindowsBase.dll')
+
+# Both apps are self-contained and ship overlapping runtime files. Merge one publish into the
+# staging folder, failing on any conflicting file instead of letting one publish silently
+# overwrite another. Files listed in -KeepExisting keep the copy that is already staged.
+function Merge-PublishOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Source,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Destination,
+
+        [string[]] $KeepExisting = @()
+    )
+
+    $sourceRoot = [System.IO.Path]::GetFullPath($Source).TrimEnd('\') + '\'
+    foreach ($file in Get-ChildItem -LiteralPath $Source -File -Recurse) {
+        $relativePath = $file.FullName.Substring($sourceRoot.Length)
+        $target = Join-Path $Destination $relativePath
+        if (Test-Path -LiteralPath $target) {
+            $sourceHash = (Get-FileHash -LiteralPath $file.FullName).Hash
+            $targetHash = (Get-FileHash -LiteralPath $target).Hash
+            if ($sourceHash -ne $targetHash -and $KeepExisting -notcontains $relativePath) {
+                throw "The app and CLI publish different versions of '$relativePath'; align their package versions."
+            }
+
+            continue
+        }
+
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $target
+    }
+}
+
+foreach ($directory in @($appPublishDir, $cliPublishDir, $stagingDir)) {
+    Assert-ChildPath -Parent $repoRoot -Child $directory
+    if (Test-Path -LiteralPath $directory) {
+        Remove-Item -LiteralPath $directory -Recurse -Force
+    }
+
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+}
+
+Assert-ChildPath -Parent $repoRoot -Child $installerOutputDir
 New-Item -ItemType Directory -Path $installerOutputDir -Force | Out-Null
 
-dotnet publish $projectPath `
-    --configuration $Configuration `
-    --runtime $RuntimeIdentifier `
-    --self-contained true `
-    --output $publishDir `
-    -p:PublishSingleFile=false `
-    -p:Version=$Version `
-    -p:AssemblyVersion=$VersionInfoVersion `
-    -p:FileVersion=$VersionInfoVersion `
-    -p:InformationalVersion=$Version
-
-dotnet publish $cliProjectPath `
-    --configuration $Configuration `
-    --runtime $RuntimeIdentifier `
-    --self-contained true `
-    --output $publishDir `
-    -p:PublishSingleFile=false `
-    -p:Version=$Version `
-    -p:AssemblyVersion=$VersionInfoVersion `
-    -p:FileVersion=$VersionInfoVersion `
-    -p:InformationalVersion=$Version
+Invoke-Publish -Project $projectPath -Output $appPublishDir
+Invoke-Publish -Project $cliProjectPath -Output $cliPublishDir
+Merge-PublishOutput -Source $appPublishDir -Destination $stagingDir
+Merge-PublishOutput -Source $cliPublishDir -Destination $stagingDir -KeepExisting $desktopRuntimeFiles
 
 $iscc = Get-InnoSetupCompiler
 
@@ -127,7 +182,7 @@ $previousOutputDir = $env:HSWIN_OUTPUT_DIR
 try {
     $env:HSWIN_VERSION = $Version
     $env:HSWIN_VERSION_INFO_VERSION = $VersionInfoVersion
-    $env:HSWIN_PUBLISH_DIR = $publishDir
+    $env:HSWIN_PUBLISH_DIR = $stagingDir
     $env:HSWIN_OUTPUT_DIR = $installerOutputDir
 
     & $iscc $installerScriptPath

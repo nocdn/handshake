@@ -46,6 +46,22 @@ public sealed class ProgramTests
     }
 
     [Fact]
+    public void RunConfigLintHelpDescribesWhatLintCatches()
+    {
+        using var output = new StringWriter();
+        using var error = new StringWriter();
+
+        var exitCode = Program.Run(["config", "lint", "--help"], output, error);
+
+        Assert.Equal(0, exitCode);
+        var help = output.ToString();
+        Assert.Contains("line and column", help, StringComparison.Ordinal);
+        Assert.Contains("hs.keyboard.repeatPulse", help, StringComparison.Ordinal);
+        Assert.Contains("5 seconds", help, StringComparison.Ordinal);
+        Assert.Empty(error.ToString());
+    }
+
+    [Fact]
     public void RunConfigLintReturnsSuccessForValidConfig()
     {
         using var directory = new TemporaryDirectory();

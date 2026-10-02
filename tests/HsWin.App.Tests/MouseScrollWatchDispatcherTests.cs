@@ -1,3 +1,4 @@
+using HsWin.Core.Scripting;
 using HsWin.App.Mouse;
 using HsWin.Core.Logging;
 using HsWin.Core.Mouse;
@@ -16,7 +17,6 @@ public sealed class MouseScrollWatchDispatcherTests
         var subscription = CreateSubscription(blocking: false, _ =>
         {
             called = true;
-            return true;
         });
 
         var shouldSwallow = dispatcher.Dispatch(CreateSnapshot(), [subscription]);
@@ -28,7 +28,7 @@ public sealed class MouseScrollWatchDispatcherTests
         scheduled();
 
         Assert.True(called);
-        Assert.Contains(logger.Warnings, warning => warning.Contains("non-blocking watcher", StringComparison.Ordinal));
+        Assert.Empty(logger.Warnings);
     }
 
     [Fact]
@@ -40,7 +40,6 @@ public sealed class MouseScrollWatchDispatcherTests
         var subscription = CreateSubscription(blocking: true, _ =>
         {
             called = true;
-            return false;
         });
 
         var shouldSwallow = dispatcher.Dispatch(CreateSnapshot(), [subscription]);
@@ -55,13 +54,74 @@ public sealed class MouseScrollWatchDispatcherTests
     }
 
     [Fact]
+    public void ABacklogBeyondTheLimitIsDroppedWithASingleWarning()
+    {
+        var scheduler = new CapturingScheduler();
+        var logger = new CapturingRuntimeLogger();
+        var dispatcher = new MouseScrollWatchDispatcher(logger, scheduler);
+        var delivered = 0;
+        var subscription = CreateSubscription(blocking: false, _ => delivered++);
+
+        for (var index = 0; index < MouseScrollWatchSubscription.MaxPendingCallbacks + 50; index++)
+        {
+            dispatcher.Dispatch(CreateSnapshot(), [subscription]);
+        }
+
+        Assert.Equal(MouseScrollWatchSubscription.MaxPendingCallbacks, scheduler.Callbacks.Count);
+        Assert.Single(logger.Warnings);
+        Assert.Contains("falling behind", logger.Warnings[0], StringComparison.Ordinal);
+
+        foreach (var callback in scheduler.Callbacks.ToArray())
+        {
+            callback();
+        }
+
+        Assert.Equal(MouseScrollWatchSubscription.MaxPendingCallbacks, delivered);
+    }
+
+    [Fact]
+    public void DeliveryResumesOnceTheBacklogDrains()
+    {
+        var scheduler = new CapturingScheduler();
+        var dispatcher = new MouseScrollWatchDispatcher(new CapturingRuntimeLogger(), scheduler);
+        var delivered = 0;
+        var subscription = CreateSubscription(blocking: false, _ => delivered++);
+        for (var index = 0; index < MouseScrollWatchSubscription.MaxPendingCallbacks; index++)
+        {
+            dispatcher.Dispatch(CreateSnapshot(), [subscription]);
+        }
+
+        scheduler.Callbacks[0]();
+        dispatcher.Dispatch(CreateSnapshot(), [subscription]);
+
+        Assert.Equal(MouseScrollWatchSubscription.MaxPendingCallbacks + 1, scheduler.Callbacks.Count);
+    }
+
+    [Fact]
+    public void AFailedSchedulingReleasesItsSlot()
+    {
+        var scheduler = new CapturingScheduler { Failure = new InvalidOperationException("scheduler gone") };
+        var logger = new CapturingRuntimeLogger();
+        var dispatcher = new MouseScrollWatchDispatcher(logger, scheduler);
+        var subscription = CreateSubscription(blocking: false, _ => { });
+
+        for (var index = 0; index < MouseScrollWatchSubscription.MaxPendingCallbacks * 2; index++)
+        {
+            dispatcher.Dispatch(CreateSnapshot(), [subscription]);
+        }
+
+        Assert.Empty(logger.Warnings);
+        Assert.Equal(MouseScrollWatchSubscription.MaxPendingCallbacks * 2, logger.Errors.Count);
+    }
+
+    [Fact]
     public void SkipsAxesOutsideWatcherFilter()
     {
         var scheduler = new CapturingScheduler();
         var dispatcher = new MouseScrollWatchDispatcher(new CapturingRuntimeLogger(), scheduler);
         var subscription = CreateSubscription(
             blocking: true,
-            _ => true,
+            _ => { },
             axes: MouseScrollAxis.Horizontal);
 
         var shouldSwallow = dispatcher.Dispatch(CreateSnapshot(vertical: true), [subscription]);
@@ -75,7 +135,7 @@ public sealed class MouseScrollWatchDispatcherTests
     {
         var scheduler = new CapturingScheduler();
         var dispatcher = new MouseScrollWatchDispatcher(new CapturingRuntimeLogger(), scheduler);
-        var subscription = CreateSubscription(blocking: true, _ => true, includeInjected: false);
+        var subscription = CreateSubscription(blocking: true, _ => { }, includeInjected: false);
 
         var shouldSwallow = dispatcher.Dispatch(CreateSnapshot(isInjected: true), [subscription]);
 
@@ -87,8 +147,8 @@ public sealed class MouseScrollWatchDispatcherTests
     {
         var scheduler = new CapturingScheduler();
         var dispatcher = new MouseScrollWatchDispatcher(new CapturingRuntimeLogger(), scheduler);
-        var first = CreateSubscription(blocking: true, _ => false, id: 1);
-        var second = CreateSubscription(blocking: true, _ => false, id: 2);
+        var first = CreateSubscription(blocking: true, _ => { }, id: 1);
+        var second = CreateSubscription(blocking: true, _ => { }, id: 2);
 
         var shouldSwallow = dispatcher.Dispatch(CreateSnapshot(), [first, second]);
 
@@ -101,8 +161,8 @@ public sealed class MouseScrollWatchDispatcherTests
     {
         var scheduler = new CapturingScheduler();
         var dispatcher = new MouseScrollWatchDispatcher(new CapturingRuntimeLogger(), scheduler);
-        var nonBlocking = CreateSubscription(blocking: false, _ => false, id: 1);
-        var blocking = CreateSubscription(blocking: true, _ => false, id: 2);
+        var nonBlocking = CreateSubscription(blocking: false, _ => { }, id: 1);
+        var blocking = CreateSubscription(blocking: true, _ => { }, id: 2);
 
         var shouldSwallow = dispatcher.Dispatch(CreateSnapshot(), [nonBlocking, blocking]);
 
@@ -119,7 +179,6 @@ public sealed class MouseScrollWatchDispatcherTests
         var subscription = CreateSubscription(blocking: true, _ =>
         {
             called = true;
-            return false;
         }, includeInjected: true);
 
         var shouldSwallow = dispatcher.Dispatch(CreateSnapshot(isInjected: true), [subscription]);
@@ -133,7 +192,7 @@ public sealed class MouseScrollWatchDispatcherTests
 
     private static MouseScrollWatchSubscription CreateSubscription(
         bool blocking,
-        Func<MouseScrollEventSnapshot, bool> callback,
+        Action<MouseScrollEventSnapshot> callback,
         MouseScrollAxis axes = MouseScrollAxis.Both,
         bool includeInjected = false,
         long id = 1)
@@ -161,28 +220,20 @@ public sealed class MouseScrollWatchDispatcherTests
             Y: 2);
     }
 
-    private sealed class CapturingScheduler : IMouseScrollWatchCallbackScheduler
+    private sealed class CapturingScheduler : IScriptCallbackScheduler
     {
         public List<Action> Callbacks { get; } = [];
 
+        public Exception? Failure { get; set; }
+
         public void Schedule(Action callback)
         {
+            if (Failure is not null)
+            {
+                throw Failure;
+            }
+
             Callbacks.Add(callback);
-        }
-    }
-
-    private sealed class CapturingRuntimeLogger : IRuntimeLogger
-    {
-        public List<string> Warnings { get; } = [];
-
-        public void Info(string message)
-        {
-        }
-
-        public void Warning(string message) => Warnings.Add(message);
-
-        public void Error(string message, Exception? exception = null)
-        {
         }
     }
 }

@@ -20,6 +20,7 @@ internal sealed class ScriptCallbackInvoker
     private readonly object _callbackGate = new();
     private readonly IAlertPresenter _alerts;
     private readonly IRuntimeLogger _logger;
+    private int _closed;
 
     public ScriptCallbackInvoker(IAlertPresenter alerts, IRuntimeLogger logger)
     {
@@ -27,11 +28,42 @@ internal sealed class ScriptCallbackInvoker
         _logger = logger;
     }
 
+    /// <summary>True once the owning config generation has ended; callbacks then never run.</summary>
+    public bool IsClosed => Volatile.Read(ref _closed) != 0;
+
+    /// <summary>
+    /// Ends this generation: no new callback starts, and the caller waits (bounded) for a callback
+    /// already inside the engine to leave before the engine is torn down.
+    /// </summary>
+    /// <returns>false when a callback was still running after <paramref name="wait"/>.</returns>
+    public bool Close(TimeSpan wait)
+    {
+        Volatile.Write(ref _closed, 1);
+        var lockTaken = false;
+        try
+        {
+            Monitor.TryEnter(_callbackGate, wait, ref lockTaken);
+            return lockTaken;
+        }
+        finally
+        {
+            if (lockTaken)
+            {
+                Monitor.Exit(_callbackGate);
+            }
+        }
+    }
+
     public void InvokeHotkeyCallback(ScriptObject scriptFunction)
     {
         var queuedAt = Stopwatch.GetTimestamp();
         lock (_callbackGate)
         {
+            if (IsClosed)
+            {
+                return;
+            }
+
             var startedAt = Stopwatch.GetTimestamp();
             var waitMs = Stopwatch.GetElapsedTime(queuedAt, startedAt).TotalMilliseconds;
             try
@@ -103,6 +135,12 @@ internal sealed class ScriptCallbackInvoker
 
     private object? InvokeUnderGate(ScriptObject scriptFunction, object?[] args, long queuedAt)
     {
+        if (IsClosed)
+        {
+            // A timer, hook or scheduled delivery from a config that has since been reloaded.
+            return false;
+        }
+
         var startedAt = Stopwatch.GetTimestamp();
         var waitMs = Stopwatch.GetElapsedTime(queuedAt, startedAt).TotalMilliseconds;
         try

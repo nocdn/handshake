@@ -1,47 +1,67 @@
+using System.Diagnostics;
 using HsWin.App.Shell;
-using HsWin.Core.Logging;
 using HsWin.Core.Shell;
 
 namespace HsWin.App.Tests;
 
 public sealed class ProcessShellServiceTests
 {
+    private const string SlowCommand = "ping -n 30 127.0.0.1 > nul & echo secret-shell-token";
+
     [Fact]
-    public void ExecuteLogsCommandDescriptionWithoutRawCommandText()
+    public void ExecuteReturnsOutputAndExitCode()
+    {
+        var service = new ProcessShellService(new CapturingRuntimeLogger());
+
+        var result = service.Execute("echo hello", ShellExecutionOptions.Default);
+
+        Assert.True(result.Success);
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("hello", result.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ExecuteNeverLogsTheRawCommandText()
     {
         var logger = new CapturingRuntimeLogger();
         var service = new ProcessShellService(logger);
-        const string command = "echo secret-shell-token";
 
-        service.Execute(command, ShellExecutionOptions.Default);
+        service.Execute("echo secret-shell-token", ShellExecutionOptions.Default);
+        service.Execute(SlowCommand, new ShellExecutionOptions(null, 300));
 
-        Assert.Contains(logger.Infos, message => message.Contains("Command completed", StringComparison.Ordinal));
-        Assert.DoesNotContain(logger.Infos, message => message.Contains("secret-shell-token", StringComparison.Ordinal));
-        Assert.Contains(logger.Infos, message => message.Contains("length=", StringComparison.Ordinal));
-        Assert.Contains(logger.Infos, message => message.Contains("sha256=", StringComparison.Ordinal));
+        Assert.NotEmpty(logger.All);
+        Assert.DoesNotContain(logger.All, message => message.Contains("secret-shell-token", StringComparison.Ordinal));
     }
 
-    private sealed class CapturingRuntimeLogger : IRuntimeLogger
+    [Fact]
+    public void TimedOutCommandIsKilledAndLoggedByDescription()
     {
-        public List<string> Infos { get; } = [];
+        var logger = new CapturingRuntimeLogger();
+        var service = new ProcessShellService(logger);
+        var startedAt = Stopwatch.GetTimestamp();
 
-        public List<string> Warnings { get; } = [];
+        var result = service.Execute(SlowCommand, new ShellExecutionOptions(null, 300));
 
-        public List<string> Errors { get; } = [];
+        Assert.True(result.TimedOut);
+        Assert.False(result.Success);
+        Assert.True(Stopwatch.GetElapsedTime(startedAt) < TimeSpan.FromSeconds(10), "The command was not stopped at its timeout.");
+        var warning = Assert.Single(logger.Warnings);
+        Assert.Contains("length=", warning, StringComparison.Ordinal);
+        Assert.Contains("sha256=", warning, StringComparison.Ordinal);
+    }
 
-        public void Info(string message)
-        {
-            Infos.Add(message);
-        }
+    [Fact]
+    public void CancellingStopsTheCommandAndReportsCancelled()
+    {
+        var service = new ProcessShellService(new CapturingRuntimeLogger());
+        using var cancellation = new CancellationTokenSource();
+        cancellation.CancelAfter(300);
+        var startedAt = Stopwatch.GetTimestamp();
 
-        public void Warning(string message)
-        {
-            Warnings.Add(message);
-        }
+        var result = service.Execute(SlowCommand, new ShellExecutionOptions(null, 60_000), cancellation.Token);
 
-        public void Error(string message, Exception exception)
-        {
-            Errors.Add($"{message} {exception.Message}");
-        }
+        Assert.True(result.Cancelled);
+        Assert.False(result.TimedOut);
+        Assert.True(Stopwatch.GetElapsedTime(startedAt) < TimeSpan.FromSeconds(10), "The command was not stopped on cancel.");
     }
 }

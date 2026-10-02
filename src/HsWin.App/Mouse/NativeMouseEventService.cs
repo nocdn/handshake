@@ -8,16 +8,17 @@ namespace HsWin.App.Mouse;
 /// Script-facing mouse event service. Scroll watches share the single WH_MOUSE_LL host used
 /// for mouse-button hotkeys so multipurpose configs do not install a second low-level hook.
 /// </summary>
-internal sealed class NativeMouseEventService : IMouseEventService
+internal sealed class NativeMouseEventService : IMouseEventService, IMouseButtonEventService
 {
     private readonly NativeMouseHotkeyHook _mouseHook;
+    public IDisposable WatchPhysicalButtons(Action<PhysicalMouseButtonEvent> callback) => _mouseHook.WatchPhysicalButtons(callback);
 
     public NativeMouseEventService(NativeMouseHotkeyHook mouseHook)
     {
         _mouseHook = mouseHook ?? throw new ArgumentNullException(nameof(mouseHook));
     }
 
-    public IDisposable WatchScroll(MouseScrollWatchOptions options, Func<MouseScrollEventSnapshot, bool> callback)
+    public IDisposable WatchScroll(MouseScrollWatchOptions options, Action<MouseScrollEventSnapshot> callback)
     {
         return _mouseHook.WatchScroll(options, callback);
     }

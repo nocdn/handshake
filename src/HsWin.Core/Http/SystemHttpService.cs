@@ -6,13 +6,22 @@ namespace HsWin.Core.Http;
 
 public sealed class SystemHttpService : IHttpService
 {
-    private static readonly HttpClient HttpClient = new();
+    // Each request owns its timeout (options.TimeoutMs); the client-wide 100 s default would
+    // otherwise cancel longer requests first and look like a disposal, so the callback never ran.
+    private static readonly HttpClient SharedClient = new() { Timeout = Timeout.InfiniteTimeSpan };
 
     private readonly IRuntimeLogger _logger;
+    private readonly HttpClient _client;
 
     public SystemHttpService(IRuntimeLogger logger)
+        : this(logger, SharedClient)
+    {
+    }
+
+    internal SystemHttpService(IRuntimeLogger logger, HttpClient client)
     {
         _logger = logger;
+        _client = client;
     }
 
     public IDisposable Send(HttpRequestOptions options, Action<HttpResponseSnapshot> callback)
@@ -20,21 +29,23 @@ public sealed class SystemHttpService : IHttpService
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(callback);
 
-        var request = new HttpRequestTask(options, callback, _logger);
+        var request = new HttpRequestTask(_client, options, callback, _logger);
         request.Start();
         return request;
     }
 
     private sealed class HttpRequestTask : IDisposable
     {
+        private readonly HttpClient _client;
         private readonly HttpRequestOptions _options;
         private readonly Action<HttpResponseSnapshot> _callback;
         private readonly IRuntimeLogger _logger;
         private readonly CancellationTokenSource _cancellation = new();
         private int _disposed;
 
-        public HttpRequestTask(HttpRequestOptions options, Action<HttpResponseSnapshot> callback, IRuntimeLogger logger)
+        public HttpRequestTask(HttpClient client, HttpRequestOptions options, Action<HttpResponseSnapshot> callback, IRuntimeLogger logger)
         {
+            _client = client;
             _options = options;
             _callback = callback;
             _logger = logger;
@@ -47,10 +58,18 @@ public sealed class SystemHttpService : IHttpService
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            // The request task owns the token source's lifetime; it may already be finished.
+            try
             {
                 _cancellation.Cancel();
-                _cancellation.Dispose();
+            }
+            catch (ObjectDisposedException)
+            {
             }
         }
 
@@ -69,9 +88,9 @@ public sealed class SystemHttpService : IHttpService
 
                 AddHeaders(request, _options.Headers);
 
-                using var response = await HttpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, linked.Token).ConfigureAwait(false);
+                using var response = await _client.SendAsync(request, HttpCompletionOption.ResponseContentRead, linked.Token).ConfigureAwait(false);
                 var bodyBytes = await response.Content.ReadAsByteArrayAsync(linked.Token).ConfigureAwait(false);
-                var body = ReadBody(_options.ResponseType, bodyBytes, response.Content.Headers.ContentType?.CharSet);
+                var body = SystemHttpService.ReadBody(_options.ResponseType, bodyBytes, response.Content.Headers.ContentType?.CharSet);
                 var headers = ReadHeaders(response);
                 _logger.Info($"HTTP request completed method='{_options.Method}' url={LogSanitizer.DescribeUrl(_options.Url)} statusCode={(int)response.StatusCode}.");
                 InvokeCallback(new HttpResponseSnapshot(
@@ -95,6 +114,10 @@ public sealed class SystemHttpService : IHttpService
             {
                 _logger.Error("HTTP request failed.", exception);
                 InvokeCallback(new HttpResponseSnapshot(false, null, "error", new Dictionary<string, string>(), string.Empty, TimedOut: false, exception.Message));
+            }
+            finally
+            {
+                _cancellation.Dispose();
             }
         }
 
@@ -136,28 +159,7 @@ public sealed class SystemHttpService : IHttpService
         {
             if (options.Multipart.Count > 0)
             {
-                var multipart = new MultipartFormDataContent();
-                foreach (var part in options.Multipart)
-                {
-                    if (!string.IsNullOrWhiteSpace(part.Path))
-                    {
-                        var filePath = Environment.ExpandEnvironmentVariables(part.Path);
-                        var stream = File.OpenRead(filePath);
-                        var fileContent = new StreamContent(stream);
-                        if (!string.IsNullOrWhiteSpace(part.ContentType))
-                        {
-                            fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse(part.ContentType);
-                        }
-
-                        multipart.Add(fileContent, part.Name, part.FileName ?? Path.GetFileName(filePath));
-                    }
-                    else
-                    {
-                        multipart.Add(new StringContent(part.Value ?? string.Empty), part.Name);
-                    }
-                }
-
-                return multipart;
+                return CreateMultipartContent(options.Multipart);
             }
 
             if (options.Form.Count > 0)
@@ -179,6 +181,47 @@ public sealed class SystemHttpService : IHttpService
             return null;
         }
 
+        /// <summary>Builds the multipart body; if any file cannot be opened, every file opened so far is closed.</summary>
+        private static MultipartFormDataContent CreateMultipartContent(IReadOnlyList<HttpMultipartPart> parts)
+        {
+            var multipart = new MultipartFormDataContent();
+            try
+            {
+                foreach (var part in parts)
+                {
+                    if (string.IsNullOrWhiteSpace(part.Path))
+                    {
+                        multipart.Add(new StringContent(part.Value ?? string.Empty), part.Name);
+                        continue;
+                    }
+
+                    var filePath = Environment.ExpandEnvironmentVariables(part.Path);
+                    var fileContent = new StreamContent(File.OpenRead(filePath));
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(part.ContentType))
+                        {
+                            fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse(part.ContentType);
+                        }
+
+                        multipart.Add(fileContent, part.Name, part.FileName ?? Path.GetFileName(filePath));
+                    }
+                    catch
+                    {
+                        fileContent.Dispose();
+                        throw;
+                    }
+                }
+
+                return multipart;
+            }
+            catch
+            {
+                multipart.Dispose();
+                throw;
+            }
+        }
+
         private static void AddHeaders(HttpRequestMessage request, IReadOnlyDictionary<string, string> headers)
         {
             foreach (var header in headers)
@@ -190,18 +233,6 @@ public sealed class SystemHttpService : IHttpService
             }
         }
 
-        private static string ReadBody(string responseType, byte[] bodyBytes, string? charset)
-        {
-            if (responseType.Equals("base64", StringComparison.OrdinalIgnoreCase))
-            {
-                return Convert.ToBase64String(bodyBytes);
-            }
-
-            var encoding = !string.IsNullOrWhiteSpace(charset)
-                ? Encoding.GetEncoding(charset)
-                : Encoding.UTF8;
-            return encoding.GetString(bodyBytes);
-        }
 
         private static IReadOnlyDictionary<string, string> ReadHeaders(HttpResponseMessage response)
         {
@@ -217,6 +248,35 @@ public sealed class SystemHttpService : IHttpService
             }
 
             return headers;
+        }
+    }
+
+    internal static string ReadBody(string responseType, byte[] bodyBytes, string? charset)
+    {
+        if (responseType.Equals("base64", StringComparison.OrdinalIgnoreCase))
+        {
+            return Convert.ToBase64String(bodyBytes);
+        }
+
+        return ResolveEncoding(charset).GetString(bodyBytes);
+    }
+
+    /// <summary>The response charset's encoding, or UTF-8 when it is missing or unknown.</summary>
+    internal static Encoding ResolveEncoding(string? charset)
+    {
+        if (string.IsNullOrWhiteSpace(charset))
+        {
+            return Encoding.UTF8;
+        }
+
+        try
+        {
+            return Encoding.GetEncoding(charset.Trim().Trim('"'));
+        }
+        catch (ArgumentException)
+        {
+            // A server's unrecognized charset label must not turn a good response into an error.
+            return Encoding.UTF8;
         }
     }
 }

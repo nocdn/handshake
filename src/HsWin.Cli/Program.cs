@@ -94,6 +94,11 @@ public static class Program
             error.WriteLine($"Could not contact the HsWin tray app: {exception.Message}");
             return 1;
         }
+        catch (UnauthorizedAccessException)
+        {
+            error.WriteLine("The HsWin command pipe belongs to another user; reload can only reach your own HsWin instance.");
+            return 1;
+        }
         catch (InvalidOperationException exception)
         {
             error.WriteLine($"Could not read the HsWin tray app response: {exception.Message}");
@@ -296,8 +301,12 @@ public static class Program
               hspn config lint --path <path>
 
             When no path is supplied, hspn lints %APPDATA%\HsWin\config.js.
-            Linting validates top-level script API usage and catches literal timer
-            intervals below 1 ms, including inside callbacks.
+            Linting runs the config against stand-in services (nothing is registered or
+            sent), so it reports syntax errors, script errors, and wrong API usage with
+            their config.js line and column. It also catches literal mistakes inside
+            callbacks: timer intervals below 1 ms, modifier keys passed to
+            hs.keyboard.repeat, and hs.keyboard.repeatPulse without keyDownMs > 0.
+            A config that does not finish within 5 seconds (an endless loop) is reported.
             """);
     }
 }

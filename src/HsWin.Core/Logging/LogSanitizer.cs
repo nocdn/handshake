@@ -14,6 +14,24 @@ public static class LogSanitizer
         return $"length={length} sha256={fingerprint}";
     }
 
+    /// <summary>
+    /// Describes a launch target without its private parts: a URL loses its query values, a path is
+    /// reduced to the file name, and a bare program name is kept as written.
+    /// </summary>
+    public static string DescribeTarget(string target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+
+        if (target.Contains("://", StringComparison.Ordinal))
+        {
+            return DescribeUrl(target);
+        }
+
+        // A trailing separator means a folder: its name can identify a user, so only its length is kept.
+        var name = Path.GetFileName(target);
+        return string.IsNullOrEmpty(name) ? $"target length={target.Length}" : name;
+    }
+
     public static string DescribeUrl(string url)
     {
         ArgumentNullException.ThrowIfNull(url);

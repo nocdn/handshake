@@ -24,7 +24,7 @@ public sealed class HotkeyScriptApi
         _trackResource = trackResource;
     }
 
-    public IDisposable Bind(object? modifiers, object? key, object? pressedFn)
+    public ScriptResourceHandle Bind(object? modifiers, object? key, object? pressedFn)
     {
         if (pressedFn is not ScriptObject scriptFunction)
         {
@@ -32,9 +32,9 @@ public sealed class HotkeyScriptApi
         }
 
         var definition = HotkeyParser.Parse(modifiers, key);
-        var registration = _hotkeys.Register(definition, () => _callbacks.InvokeHotkeyCallback(scriptFunction));
-        _trackResource(registration);
-        return registration;
+        var handle = new ScriptResourceHandle(_hotkeys.Register(definition, () => _callbacks.InvokeHotkeyCallback(scriptFunction)));
+        _trackResource(handle);
+        return handle;
     }
 
     public ScriptResourceHandle BindHeld(object? modifiers, object? key, object? pressedFn, object? releasedFn, object? options = null)
@@ -119,20 +119,18 @@ public sealed class HotkeyScriptApi
         }
 
         return new HotkeyHeldOptions(
-            ConvertOptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "includeInjected"), HotkeyHeldOptions.Default.IncludeInjected),
-            ConvertOptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "blocking", "swallow"), HotkeyHeldOptions.Default.Blocking),
-            ConvertOptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "allowExtraModifiers", "allowExtra"), HotkeyHeldOptions.Default.AllowExtraModifiers),
-            ConvertOptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "repeat", "retrigger"), HotkeyHeldOptions.Default.Repeat));
+            ScriptArgumentReader.OptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "includeInjected"), "includeInjected", HotkeyHeldOptions.Default.IncludeInjected),
+            ScriptArgumentReader.OptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "blocking", "swallow"), "blocking", HotkeyHeldOptions.Default.Blocking),
+            ScriptArgumentReader.OptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "allowExtraModifiers", "allowExtra"), "allowExtraModifiers", HotkeyHeldOptions.Default.AllowExtraModifiers),
+            ScriptArgumentReader.OptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "repeat", "retrigger"), "repeat", HotkeyHeldOptions.Default.Repeat));
     }
 
-    private static bool ConvertOptionalBoolean(object? value, bool defaultValue)
-    {
-        return ScriptArgumentReader.IsMissing(value)
-            ? defaultValue
-            : Convert.ToBoolean(value, CultureInfo.InvariantCulture);
-    }
-
-    private sealed class HeldHotkeyHandler
+    /// <summary>
+    /// Press/release state for a keyboard held hotkey. Modifier events always pass through so the
+    /// OS never misses a Ctrl/Alt/Shift/Win change, and the trigger key-up is swallowed exactly
+    /// when its key-down was, so neither Windows nor the focused app sees an unmatched key.
+    /// </summary>
+    internal sealed class HeldHotkeyHandler
     {
         private readonly HotkeyDefinition _definition;
         private readonly HotkeyHeldOptions _options;
@@ -140,6 +138,7 @@ public sealed class HotkeyScriptApi
         private readonly ScriptObject _releasedFunction;
         private readonly ScriptCallbackInvoker _callbacks;
         private bool _active;
+        private bool _triggerDownSwallowed;
 
         public HeldHotkeyHandler(
             HotkeyDefinition definition,
@@ -157,70 +156,80 @@ public sealed class HotkeyScriptApi
 
         public bool Handle(KeyboardEventSnapshot snapshot)
         {
-            if (_active && ShouldRelease(snapshot))
+            if (snapshot.IsModifier)
             {
-                _active = false;
-                // Always attempt release; fail-open still clears host active state so keys are not stuck swallowed.
-                _ = InvokeHeldCallback(_releasedFunction, snapshot);
-                return _options.Blocking;
-            }
-
-            if (snapshot.IsKeyDown && snapshot.KeyCode == _definition.VirtualKey && ModifiersMatch(snapshot.ModifierFlags))
-            {
-                if (!_active || _options.Repeat)
+                if (_active && !ModifiersMatch(snapshot.ModifierFlags))
                 {
-                    if (!InvokeHeldCallback(_pressedFunction, snapshot))
-                    {
-                        // Fail-open: do not mark active and do not swallow — pass the key through.
-                        return false;
-                    }
-
-                    _active = true;
+                    Release(snapshot);
                 }
 
-                return _options.Blocking;
+                return false;
             }
 
-            return false;
+            if (snapshot.KeyCode != _definition.VirtualKey)
+            {
+                return false;
+            }
+
+            if (snapshot.IsKeyUp)
+            {
+                if (_active)
+                {
+                    Release(snapshot);
+                }
+
+                var swallowKeyUp = _triggerDownSwallowed;
+                _triggerDownSwallowed = false;
+                return swallowKeyUp;
+            }
+
+            if (!snapshot.IsKeyDown || !ModifiersMatch(snapshot.ModifierFlags))
+            {
+                // A key-down that reaches the OS needs its key-up to reach it too.
+                _triggerDownSwallowed = false;
+                return false;
+            }
+
+            if ((!_active || _options.Repeat) && !Press(snapshot))
+            {
+                // Fail-open: the script gate was busy, so this key-down goes to the OS.
+                _triggerDownSwallowed = false;
+                return false;
+            }
+
+            _triggerDownSwallowed = _options.Blocking;
+            return _options.Blocking;
+        }
+
+        private bool Press(KeyboardEventSnapshot snapshot)
+        {
+            if (!InvokeHeldCallback(_pressedFunction, snapshot))
+            {
+                return false;
+            }
+
+            _active = true;
+            return true;
+        }
+
+        private void Release(KeyboardEventSnapshot snapshot)
+        {
+            // Clear state first: even a fail-open skip must not leave the hotkey stuck active.
+            _active = false;
+            _ = InvokeHeldCallback(_releasedFunction, snapshot);
         }
 
         /// <returns>false when a blocking fail-open skip occurred (script gate busy).</returns>
         private bool InvokeHeldCallback(ScriptObject function, KeyboardEventSnapshot snapshot)
         {
+            var arguments = ScriptEventArguments.Keyboard(snapshot);
             if (_options.Blocking)
             {
-                return _callbacks.TryInvokeScriptCallbackFailOpen(
-                    function,
-                    out _,
-                    snapshot.Type,
-                    snapshot.KeyCode,
-                    snapshot.Key,
-                    snapshot.ModifierFlags,
-                    snapshot.IsKeyDown,
-                    snapshot.IsKeyUp,
-                    snapshot.IsModifier,
-                    snapshot.IsInjected,
-                    snapshot.IsExtended);
+                return _callbacks.TryInvokeScriptCallbackFailOpen(function, out _, arguments);
             }
 
-            _callbacks.InvokeScriptCallback(
-                function,
-                snapshot.Type,
-                snapshot.KeyCode,
-                snapshot.Key,
-                snapshot.ModifierFlags,
-                snapshot.IsKeyDown,
-                snapshot.IsKeyUp,
-                snapshot.IsModifier,
-                snapshot.IsInjected,
-                snapshot.IsExtended);
+            _callbacks.InvokeScriptCallback(function, arguments);
             return true;
-        }
-
-        private bool ShouldRelease(KeyboardEventSnapshot snapshot)
-        {
-            return snapshot.IsKeyUp && snapshot.KeyCode == _definition.VirtualKey
-                || snapshot.IsModifier && !ModifiersMatch(snapshot.ModifierFlags);
         }
 
         private bool ModifiersMatch(uint modifierFlags)

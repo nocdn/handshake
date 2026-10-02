@@ -1,9 +1,10 @@
 using HsWin.App.Mouse;
+using HsWin.App.Native;
+using HsWin.App.Threading;
 using HsWin.Core.Hotkeys;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
 using HsWin.Core.Mouse;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
@@ -16,14 +17,12 @@ namespace HsWin.App.Hotkeys;
 internal sealed class NativeMouseHotkeyHook : IDisposable
 {
     private const int HcAction = 0;
-    private const int WhMouseLl = 14;
     private const int WmMButtonDown = 0x0207;
     private const int WmMButtonUp = 0x0208;
     private const int WmMouseWheel = 0x020A;
     private const int WmXButtonDown = 0x020B;
     private const int WmXButtonUp = 0x020C;
     private const int WmMouseHWheel = 0x020E;
-    private const int WmQuit = 0x0012;
     private const int XButton1 = 0x0001;
     private const int XButton2 = 0x0002;
     private const uint LlmhfInjected = 0x00000001;
@@ -33,11 +32,11 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
     private const int VkLWin = 0x5B;
     private const int VkRWin = 0x5C;
     private const short KeyPressedMask = unchecked((short)0x8000);
-    private static readonly TimeSpan HookInstallTimeout = TimeSpan.FromSeconds(5);
 
     private readonly object _gate = new();
     private readonly IRuntimeLogger _logger;
     private readonly IMouseHookPlatform _platform;
+    private readonly LowLevelHookThread _hook;
     private readonly IKeyboardEventService? _keyboardEvents;
     private readonly SynchronizationContext? _callbackContext;
     private readonly MouseScrollWatchDispatcher _scrollDispatcher;
@@ -45,16 +44,13 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
     private readonly Dictionary<(HotkeyMouseButton Button, HotkeyModifiers Modifiers), RegistrationState> _registrationsByHotkey = [];
     private readonly Dictionary<HotkeyMouseButton, RegistrationState> _activeRegistrations = [];
     private readonly List<MouseScrollWatchSubscription> _scrollSubscriptions = [];
+    private readonly List<ButtonObserver> _buttonObservers = [];
+    private ButtonObserver[] _buttonObserverSnapshot = [];
 
     // Immutable snapshot of _scrollSubscriptions, rebuilt under _gate on every mutation and read
     // without allocation on the hook thread (wheel events can fire thousands of times per second).
     private MouseScrollWatchSubscription[] _scrollSubscriptionSnapshot = [];
 
-    private readonly MouseHookProcedure _hookProcedure;
-    private IntPtr _hookHandle;
-    private Thread? _hookThread;
-    private uint _hookThreadId;
-    private Exception? _hookInstallException;
     private int _nextId = 1;
     private long _nextScrollSubscriptionId;
     private bool _disposed;
@@ -78,8 +74,8 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         _scrollDispatcher = scrollDispatcher
             ?? new MouseScrollWatchDispatcher(
                 logger,
-                new SynchronizationContextMouseScrollWatchCallbackScheduler(callbackContext));
-        _hookProcedure = HookCallback;
+                new SynchronizationContextCallbackScheduler(callbackContext));
+        _hook = new LowLevelHookThread(LowLevelHookThread.MouseHookId, "HsWin Mouse Hook", HookCallback, platform, logger);
     }
 
     public IDisposable Register(HotkeyDefinition hotkey, Action pressed)
@@ -92,7 +88,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         return RegisterInternal(hotkey, pressed, released, blocking);
     }
 
-    public IDisposable WatchScroll(MouseScrollWatchOptions options, Func<MouseScrollEventSnapshot, bool> callback)
+    public IDisposable WatchScroll(MouseScrollWatchOptions options, Action<MouseScrollEventSnapshot> callback)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(callback);
@@ -100,7 +96,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            EnsureHookInstalled();
+            _hook.EnsureInstalled();
 
             var subscription = new MouseScrollWatchSubscription(
                 Interlocked.Increment(ref _nextScrollSubscriptionId),
@@ -123,6 +119,20 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
                 $"blocking={options.Blocking} prepend={options.Prepend} axes={FormatAxes(options.Axes)} " +
                 $"scrollCount={_scrollSubscriptions.Count} hotkeyCount={_registrations.Count}.");
             return subscription;
+        }
+    }
+
+    public IDisposable WatchPhysicalButtons(Action<PhysicalMouseButtonEvent> callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _hook.EnsureInstalled();
+            var observer = new ButtonObserver(this, callback);
+            _buttonObservers.Add(observer);
+            Volatile.Write(ref _buttonObserverSnapshot, [.. _buttonObservers]);
+            return observer;
         }
     }
 
@@ -152,7 +162,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
                 throw new InvalidOperationException($"Mouse hotkey {hotkey} is already registered.");
             }
 
-            EnsureHookInstalled();
+            _hook.EnsureInstalled();
 
             var id = _nextId++;
             var registration = new RegistrationState(id, hotkey, pressed, released, blocking);
@@ -180,11 +190,14 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
             }
 
             _scrollSubscriptions.Clear();
+            foreach (var observer in _buttonObservers) observer.Deactivate();
+            _buttonObservers.Clear();
+            Volatile.Write(ref _buttonObserverSnapshot, []);
             RebuildScrollSubscriptionSnapshot();
             _registrations.Clear();
             _registrationsByHotkey.Clear();
             _activeRegistrations.Clear(); // explicit: no stale button-up after dispose
-            UninstallHook();
+            _hook.Uninstall();
             _disposed = true;
         }
     }
@@ -279,7 +292,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
     {
         if (code != HcAction)
         {
-            return _platform.CallNextHookEx(_hookHandle, code, wParam, lParam);
+            return _hook.CallNext(code, wParam, lParam);
         }
 
         var message = wParam.ToInt32();
@@ -293,14 +306,22 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         if (message is WmMButtonDown or WmMButtonUp or WmXButtonDown or WmXButtonUp)
         {
             var hookData = Marshal.PtrToStructure<MouseHookStruct>(lParam);
-            if (TryGetMouseButtonEvent(message, hookData.MouseData, out var mouseButtonEvent)
-                && TryHandleMouseButtonEvent(mouseButtonEvent))
+            if (TryGetMouseButtonEvent(message, hookData.MouseData, out var mouseButtonEvent))
             {
-                return new IntPtr(1);
+                if ((hookData.Flags & LlmhfInjected) == 0)
+                {
+                    var input = new PhysicalMouseButtonEvent(mouseButtonEvent.Button, mouseButtonEvent.IsDown, ReadPressedModifiers());
+                    foreach (var observer in Volatile.Read(ref _buttonObserverSnapshot))
+                    {
+                        try { observer.Deliver(input); }
+                        catch (Exception exception) { _logger.Error("Physical mouse observer failed.", exception); }
+                    }
+                }
+                if (TryHandleMouseButtonEvent(mouseButtonEvent)) return new IntPtr(1);
             }
         }
 
-        return _platform.CallNextHookEx(_hookHandle, code, wParam, lParam);
+        return _hook.CallNext(code, wParam, lParam);
     }
 
     private IntPtr HandleScrollMessage(int code, IntPtr wParam, IntPtr lParam, int message)
@@ -311,7 +332,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         {
             if (_scrollSubscriptions.Count == 0)
             {
-                return _platform.CallNextHookEx(_hookHandle, code, wParam, lParam);
+                return _hook.CallNext(code, wParam, lParam);
             }
 
             var hookData = Marshal.PtrToStructure<MouseHookStruct>(lParam);
@@ -324,7 +345,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
                     ReadPressedModifiers(),
                     out snapshot))
             {
-                return _platform.CallNextHookEx(_hookHandle, code, wParam, lParam);
+                return _hook.CallNext(code, wParam, lParam);
             }
 
             subscriptions = _scrollSubscriptionSnapshot;
@@ -333,7 +354,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         var shouldSwallow = _scrollDispatcher.Dispatch(snapshot, subscriptions);
         return shouldSwallow
             ? new IntPtr(1)
-            : _platform.CallNextHookEx(_hookHandle, code, wParam, lParam);
+            : _hook.CallNext(code, wParam, lParam);
     }
 
     private bool TryHandleMouseButtonEvent(MouseButtonEvent mouseButtonEvent)
@@ -397,82 +418,6 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         callback();
     }
 
-    private void EnsureHookInstalled()
-    {
-        if (_hookHandle != IntPtr.Zero)
-        {
-            return;
-        }
-
-        _hookInstallException = null;
-        using var ready = new ManualResetEventSlim();
-        _hookThread = new Thread(() => HookThreadMain(ready))
-        {
-            IsBackground = true,
-            Name = "HsWin Mouse Hook"
-        };
-        _hookThread.SetApartmentState(ApartmentState.STA);
-        _hookThread.Start();
-
-        if (!ready.Wait(HookInstallTimeout))
-        {
-            // Best-effort: stop a late-finishing install thread so we do not leave an orphaned hook.
-            if (_hookThreadId != 0)
-            {
-                _ = _platform.PostThreadMessage(_hookThreadId, WmQuit, IntPtr.Zero, IntPtr.Zero);
-            }
-
-            if (_hookHandle != IntPtr.Zero)
-            {
-                _ = _platform.UnhookWindowsHookEx(_hookHandle);
-                _hookHandle = IntPtr.Zero;
-            }
-
-            _hookThreadId = 0;
-            _hookThread = null;
-            var exception = new TimeoutException($"Timed out after {HookInstallTimeout.TotalMilliseconds:F0}ms while installing WH_MOUSE_LL hook.");
-            _logger.Error("Low-level mouse hook installation timed out.", exception);
-            throw exception;
-        }
-
-        if (_hookInstallException is not null)
-        {
-            throw _hookInstallException;
-        }
-
-        if (_hookHandle == IntPtr.Zero)
-        {
-            throw new InvalidOperationException("WH_MOUSE_LL hook thread started without publishing a hook handle.");
-        }
-    }
-
-    private void HookThreadMain(ManualResetEventSlim ready)
-    {
-        _hookThreadId = _platform.GetCurrentThreadId();
-
-        var hookHandle = _platform.SetWindowsHookEx(WhMouseLl, _hookProcedure, _platform.GetModuleHandle(null), 0);
-        if (hookHandle == IntPtr.Zero)
-        {
-            var exception = new Win32Exception(Marshal.GetLastPInvokeError(), "Could not install low-level mouse hook.");
-            _hookInstallException = exception;
-            _logger.Error("Low-level mouse hook installation failed.", exception);
-            ready.Set();
-            return;
-        }
-
-        _hookHandle = hookHandle;
-        _logger.Info($"Low-level mouse hook installed. Hook=0x{hookHandle.ToInt64():X} threadId={_hookThreadId}.");
-        ready.Set();
-
-        while (_platform.GetMessage(out var message, IntPtr.Zero, 0, 0) > 0)
-        {
-            _platform.TranslateMessage(ref message);
-            _platform.DispatchMessage(ref message);
-        }
-
-        _logger.Info($"Mouse hook thread exited threadId={_hookThreadId}.");
-    }
-
     private void Unregister(int id)
     {
         lock (_gate)
@@ -523,43 +468,11 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
 
     private void MaybeUninstallHookUnlocked()
     {
-        if (_registrations.Count == 0 && _scrollSubscriptions.Count == 0)
+        if (_registrations.Count == 0 && _scrollSubscriptions.Count == 0 && _buttonObservers.Count == 0)
         {
             _activeRegistrations.Clear();
-            UninstallHook();
+            _hook.Uninstall();
         }
-    }
-
-    private void UninstallHook()
-    {
-        var hookHandle = _hookHandle;
-        if (hookHandle == IntPtr.Zero)
-        {
-            return;
-        }
-
-        if (_platform.UnhookWindowsHookEx(hookHandle))
-        {
-            _logger.Info("Low-level mouse hook uninstalled.");
-        }
-        else
-        {
-            var exception = new Win32Exception(Marshal.GetLastPInvokeError(), "Could not uninstall low-level mouse hook.");
-            _logger.Error("Low-level mouse hook uninstall failed.", exception);
-        }
-
-        _hookHandle = IntPtr.Zero;
-        if (_hookThreadId != 0)
-        {
-            if (!_platform.PostThreadMessage(_hookThreadId, WmQuit, IntPtr.Zero, IntPtr.Zero))
-            {
-                var exception = new Win32Exception(Marshal.GetLastPInvokeError(), "Could not stop the mouse hook thread.");
-                _logger.Error("Mouse hook thread stop signal failed.", exception);
-            }
-        }
-
-        _hookThreadId = 0;
-        _hookThread = null;
     }
 
     private HotkeyModifiers ReadPressedModifiers()
@@ -612,10 +525,27 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
 
     internal readonly record struct MouseButtonEvent(HotkeyMouseButton Button, bool IsDown);
 
+    private sealed class ButtonObserver(NativeMouseHotkeyHook owner, Action<PhysicalMouseButtonEvent> callback) : IDisposable
+    {
+        private Action<PhysicalMouseButtonEvent>? _callback = callback;
+        internal void Deliver(PhysicalMouseButtonEvent input) => Volatile.Read(ref _callback)?.Invoke(input);
+        internal void Deactivate() => Interlocked.Exchange(ref _callback, null);
+        public void Dispose()
+        {
+            Deactivate();
+            lock (owner._gate)
+            {
+                owner._buttonObservers.Remove(this);
+                Volatile.Write(ref owner._buttonObserverSnapshot, [.. owner._buttonObservers]);
+                owner.MaybeUninstallHookUnlocked();
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct MouseHookStruct
     {
-        public MousePoint Point;
+        public NativePoint Point;
 
         public uint MouseData;
 
@@ -624,14 +554,6 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         public uint Time;
 
         public UIntPtr ExtraInfo;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MousePoint
-    {
-        public int X;
-
-        public int Y;
     }
 
     private sealed record RegistrationState(

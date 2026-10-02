@@ -1,23 +1,33 @@
-using HsWin.Core.Logging;
-using HsWin.Core.Media;
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
+using HsWin.App.Native;
+using HsWin.Core.Keyboard;
+using HsWin.Core.Logging;
+using HsWin.Core.Media;
+using Windows.Foundation;
 using Windows.Media.Control;
 
 namespace HsWin.App.Media;
 
-internal sealed partial class NativeMediaController : IMediaController
+internal sealed class NativeMediaController : IMediaController
 {
-    private const uint InputKeyboard = 1;
-    private const uint KeyEventKeyUp = 0x0002;
     private const ushort VkMediaNextTrack = 0xB0;
     private const ushort VkMediaPreviousTrack = 0xB1;
     private const ushort VkMediaPlayPause = 0xB3;
 
-    internal static int NativeInputSize => Marshal.SizeOf<Input>();
+    /// <summary>A media session that has not answered by now is treated as hung; the media key is sent instead.</summary>
+    private static readonly TimeSpan SessionTimeout = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Players publish the new playback status shortly after a toggle, not synchronously with it.
+    /// Waiting briefly reports the real result instead of the stale pre-toggle status.
+    /// </summary>
+    private static readonly TimeSpan StatusSettleTimeout = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan StatusPollInterval = TimeSpan.FromMilliseconds(25);
 
     private readonly IRuntimeLogger _logger;
+    private readonly object _managerGate = new();
+    private Task<GlobalSystemMediaTransportControlsSessionManager>? _managerRequest;
 
     public NativeMediaController(IRuntimeLogger logger)
     {
@@ -26,80 +36,138 @@ internal sealed partial class NativeMediaController : IMediaController
 
     public MediaCommandResult PlayPause()
     {
-        return TryControlCurrentSession(
+        return ControlCurrentSession(
             "playPause",
-            session => session.TryTogglePlayPauseAsync().AsTask().GetAwaiter().GetResult(),
+            static session => session.TryTogglePlayPauseAsync(),
             fallbackVirtualKey: VkMediaPlayPause,
-            fallbackActionName: "play/pause",
+            waitForStatusChange: true,
             inferAction: InferPlayPauseAction);
     }
 
     public MediaCommandResult PreviousTrack()
     {
-        return TryControlCurrentSession(
+        return ControlCurrentSession(
             "previousTrack",
-            session => session.TrySkipPreviousAsync().AsTask().GetAwaiter().GetResult(),
+            static session => session.TrySkipPreviousAsync(),
             fallbackVirtualKey: VkMediaPreviousTrack,
-            fallbackActionName: "previous track",
+            waitForStatusChange: false,
             inferAction: static (_, _) => "previousTrack");
     }
 
     public MediaCommandResult NextTrack()
     {
-        return TryControlCurrentSession(
+        return ControlCurrentSession(
             "nextTrack",
-            session => session.TrySkipNextAsync().AsTask().GetAwaiter().GetResult(),
+            static session => session.TrySkipNextAsync(),
             fallbackVirtualKey: VkMediaNextTrack,
-            fallbackActionName: "next track",
+            waitForStatusChange: false,
             inferAction: static (_, _) => "nextTrack");
     }
 
-    private MediaCommandResult TryControlCurrentSession(
+    /// <summary>
+    /// The action a toggle performed. A status that changed is authoritative; an unchanged one
+    /// means the player has not reported yet, so the action is the inverse of the old status.
+    /// </summary>
+    internal static string InferPlayPauseAction(string statusBefore, string statusAfter)
+    {
+        if (statusAfter != statusBefore)
+        {
+            if (statusAfter is "playing")
+            {
+                return "played";
+            }
+
+            if (statusAfter is "paused" or "stopped")
+            {
+                return "paused";
+            }
+        }
+
+        return statusBefore switch
+        {
+            "playing" => "paused",
+            "paused" or "stopped" => "played",
+            _ => "toggled"
+        };
+    }
+
+    private MediaCommandResult ControlCurrentSession(
         string command,
-        Func<GlobalSystemMediaTransportControlsSession, bool> sessionAction,
+        Func<GlobalSystemMediaTransportControlsSession, IAsyncOperation<bool>> sessionAction,
         ushort fallbackVirtualKey,
-        string fallbackActionName,
+        bool waitForStatusChange,
         Func<string, string, string> inferAction)
     {
-        var startedAt = Stopwatch.GetTimestamp();
         try
         {
-            var manager = GlobalSystemMediaTransportControlsSessionManager.RequestAsync().AsTask().GetAwaiter().GetResult();
-            var managerReadyAt = Stopwatch.GetTimestamp();
-            var session = manager.GetCurrentSession();
-            var sessionReadyAt = Stopwatch.GetTimestamp();
+            var session = GetSessionManager().GetCurrentSession();
             if (session is not null)
             {
                 var statusBefore = GetPlaybackStatus(session);
-                var beforeStatusReadyAt = Stopwatch.GetTimestamp();
-                var success = sessionAction(session);
-                var actionReadyAt = Stopwatch.GetTimestamp();
-                var statusAfter = GetPlaybackStatus(session);
-                var afterStatusReadyAt = Stopwatch.GetTimestamp();
+                var success = Await(sessionAction(session).AsTask(), command);
+                var statusAfter = success && waitForStatusChange
+                    ? WaitForStatusChange(session, statusBefore)
+                    : GetPlaybackStatus(session);
                 var action = inferAction(statusBefore, statusAfter);
-                _logger.Info(
-                    $"Media session timing command='{command}' action='{action}' success={success} statusBefore='{statusBefore}' statusAfter='{statusAfter}' " +
-                    $"requestManagerMs={ElapsedMs(startedAt, managerReadyAt):F3} getSessionMs={ElapsedMs(managerReadyAt, sessionReadyAt):F3} " +
-                    $"statusBeforeMs={ElapsedMs(sessionReadyAt, beforeStatusReadyAt):F3} actionMs={ElapsedMs(beforeStatusReadyAt, actionReadyAt):F3} " +
-                    $"statusAfterMs={ElapsedMs(actionReadyAt, afterStatusReadyAt):F3} totalMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
                 return new MediaCommandResult(command, success, action, statusBefore, statusAfter, "mediaSession");
             }
-
-            _logger.Info($"No current media session found for command='{command}' elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}. Falling back to media key.");
         }
         catch (Exception exception)
         {
-            _logger.Warning($"Media session command failed for command='{command}' elapsedMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}. Falling back to media key. {exception.Message}");
+            // The cached manager may be the problem (for example after Explorer restarted).
+            ForgetSessionManager();
+            _logger.Warning($"Media session command '{command}' failed; sending the media key instead. {exception.Message}");
         }
 
-        SendMediaKey(fallbackVirtualKey, fallbackActionName);
-        _logger.Info($"Media fallback timing command='{command}' backend='sendInput' totalMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
+        SendMediaKey(fallbackVirtualKey, command);
         return MediaCommandResult.Sent(command, "sendInput");
     }
 
-    private static double ElapsedMs(long startTimestamp, long endTimestamp)
+    /// <summary>
+    /// Requests the session manager once and reuses it; the first request costs tens of
+    /// milliseconds. Any session failure forgets it so the next command requests a fresh one.
+    /// </summary>
+    private GlobalSystemMediaTransportControlsSessionManager GetSessionManager()
     {
-        return Stopwatch.GetElapsedTime(startTimestamp, endTimestamp).TotalMilliseconds;
+        Task<GlobalSystemMediaTransportControlsSessionManager> request;
+        lock (_managerGate)
+        {
+            request = _managerRequest ??= GlobalSystemMediaTransportControlsSessionManager.RequestAsync().AsTask();
+        }
+
+        return Await(request, "session manager request");
+    }
+
+    private void ForgetSessionManager()
+    {
+        lock (_managerGate)
+        {
+            _managerRequest = null;
+        }
+    }
+
+    private static T Await<T>(Task<T> task, string description)
+    {
+        if (!task.Wait(SessionTimeout))
+        {
+            throw new TimeoutException(
+                $"Windows media session did not answer the {description} within {SessionTimeout.TotalSeconds:0}s.");
+        }
+
+        return task.GetAwaiter().GetResult();
+    }
+
+    private static string WaitForStatusChange(GlobalSystemMediaTransportControlsSession session, string statusBefore)
+    {
+        var deadline = Stopwatch.GetTimestamp() + (long)(StatusSettleTimeout.TotalSeconds * Stopwatch.Frequency);
+        var status = GetPlaybackStatus(session);
+        while (status == statusBefore && Stopwatch.GetTimestamp() < deadline)
+        {
+            Thread.Sleep(StatusPollInterval);
+            status = GetPlaybackStatus(session);
+        }
+
+        return status;
     }
 
     private static string GetPlaybackStatus(GlobalSystemMediaTransportControlsSession session)
@@ -108,35 +176,10 @@ internal sealed partial class NativeMediaController : IMediaController
         {
             return NormalizePlaybackStatus(session.GetPlaybackInfo().PlaybackStatus);
         }
-        catch
+        catch (Exception exception) when (exception is InvalidOperationException or System.Runtime.InteropServices.COMException)
         {
             return "unknown";
         }
-    }
-
-    internal static string InferPlayPauseAction(string statusBefore, string statusAfter)
-    {
-        if (statusAfter is "playing")
-        {
-            return "played";
-        }
-
-        if (statusAfter is "paused" or "stopped")
-        {
-            return "paused";
-        }
-
-        if (statusBefore is "playing")
-        {
-            return "paused";
-        }
-
-        if (statusBefore is "paused" or "stopped")
-        {
-            return "played";
-        }
-
-        return "toggled";
     }
 
     private static string NormalizePlaybackStatus(GlobalSystemMediaTransportControlsSessionPlaybackStatus status)
@@ -153,69 +196,21 @@ internal sealed partial class NativeMediaController : IMediaController
         };
     }
 
-    private unsafe void SendMediaKey(ushort virtualKey, string actionName)
+    private void SendMediaKey(ushort virtualKey, string command)
     {
-        Span<Input> inputs =
+        // Media keys are defined by their virtual key; the shell handles them without a scan code.
+        var isExtended = KeyboardKeyRules.IsExtendedVirtualKey(virtualKey);
+        ReadOnlySpan<NativeInput> inputs =
         [
-            CreateKeyboardInput(virtualKey, keyUp: false),
-            CreateKeyboardInput(virtualKey, keyUp: true)
+            NativeInputSender.VirtualKey(virtualKey, keyUp: false, isExtended),
+            NativeInputSender.VirtualKey(virtualKey, keyUp: true, isExtended)
         ];
 
-        fixed (Input* inputPointer = inputs)
+        if (!NativeInputSender.TrySend(inputs, out _, out var error))
         {
-            var sentCount = User32.SendInput((uint)inputs.Length, inputPointer, NativeInputSize);
-            if (sentCount != inputs.Length)
-            {
-                var exception = new Win32Exception(Marshal.GetLastPInvokeError(), $"Could not send media key for {actionName}.");
-                _logger.Error($"Media key send failed action='{actionName}' vk=0x{virtualKey:X2} inputSize={NativeInputSize}.", exception);
-                throw exception;
-            }
+            var exception = new Win32Exception(error, $"Could not send the media key for {command}.");
+            _logger.Error($"Media key send failed command='{command}' vk=0x{virtualKey:X2}.", exception);
+            throw exception;
         }
-
-        _logger.Info($"Media key sent action='{actionName}' vk=0x{virtualKey:X2}.");
-    }
-
-    private static Input CreateKeyboardInput(ushort virtualKey, bool keyUp)
-    {
-        return new Input
-        {
-            Type = InputKeyboard,
-            Keyboard = new KeyboardInput
-            {
-                VirtualKey = virtualKey,
-                Flags = keyUp ? KeyEventKeyUp : 0
-            }
-        };
-    }
-
-    [StructLayout(LayoutKind.Explicit, Size = 40)]
-    private struct Input
-    {
-        // INPUT is 40 bytes on 64-bit Windows because the native union is sized for MOUSEINPUT.
-        [FieldOffset(0)]
-        public uint Type;
-
-        [FieldOffset(8)]
-        public KeyboardInput Keyboard;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct KeyboardInput
-    {
-        public ushort VirtualKey;
-
-        public ushort ScanCode;
-
-        public uint Flags;
-
-        public uint Time;
-
-        public UIntPtr ExtraInfo;
-    }
-
-    private static partial class User32
-    {
-        [LibraryImport("user32.dll", SetLastError = true)]
-        public static unsafe partial uint SendInput(uint inputCount, Input* inputs, int inputSize);
     }
 }

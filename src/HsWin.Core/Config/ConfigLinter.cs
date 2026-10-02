@@ -1,11 +1,21 @@
-using System.Reflection;
 using HsWin.Core.Scripting;
-using Microsoft.ClearScript;
 
 namespace HsWin.Core.Config;
 
 public sealed class ConfigLinter
 {
+    private readonly TimeSpan _executionTimeout;
+
+    public ConfigLinter()
+        : this(ConfigLintRuntimeServices.DefaultExecutionTimeout)
+    {
+    }
+
+    internal ConfigLinter(TimeSpan executionTimeout)
+    {
+        _executionTimeout = executionTimeout;
+    }
+
     public ConfigLintResult LintFile(string filePath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
@@ -34,82 +44,25 @@ public sealed class ConfigLinter
 
         try
         {
-            using var runtime = new ScriptRuntime(ConfigLintRuntimeServices.Create());
+            using var runtime = new ScriptRuntime(ConfigLintRuntimeServices.Create(_executionTimeout));
             runtime.Reload(source, documentName);
         }
         catch (Exception exception)
         {
-            if (!IsDuplicateStaticDiagnostic(exception, diagnostics))
+            var location = ScriptErrorFormatter.FindConfigLocation(exception);
+
+            // The static analyzers already reported this line with a more specific message.
+            if (location is null || !diagnostics.Any(diagnostic => diagnostic.Line == location.Line))
             {
                 diagnostics.Add(new ConfigLintDiagnostic(
                     ConfigLintSeverity.Error,
                     "HSWIN100",
-                    FormatException(exception)));
+                    ScriptErrorFormatter.GetMessage(exception),
+                    location?.Line,
+                    location?.Column));
             }
         }
 
         return new ConfigLintResult(diagnostics);
-    }
-
-    private static string FormatException(Exception exception)
-    {
-        var unwrapped = Unwrap(exception);
-        var message = unwrapped is ScriptEngineException scriptException
-            ? scriptException.ErrorDetails ?? scriptException.Message
-            : unwrapped.Message;
-
-        message = FirstNonEmptyLine(message).Trim();
-        return message.StartsWith("Error:", StringComparison.Ordinal)
-            ? message[6..].Trim()
-            : message;
-    }
-
-    private static Exception Unwrap(Exception exception)
-    {
-        var current = exception;
-        while (true)
-        {
-            switch (current)
-            {
-                case TargetInvocationException { InnerException: { } inner }:
-                    current = inner;
-                    continue;
-                case AggregateException { InnerException: { } inner }:
-                    current = inner;
-                    continue;
-                case ScriptEngineException scriptException when scriptException.InnerException is not null:
-                    current = scriptException.InnerException;
-                    continue;
-            }
-
-            return current;
-        }
-    }
-
-    private static string FirstNonEmptyLine(string value)
-    {
-        using var reader = new StringReader(value);
-        while (reader.ReadLine() is { } line)
-        {
-            if (!string.IsNullOrWhiteSpace(line))
-            {
-                return line;
-            }
-        }
-
-        return value;
-    }
-
-    private static bool IsDuplicateStaticDiagnostic(
-        Exception exception,
-        IReadOnlyCollection<ConfigLintDiagnostic> diagnostics)
-    {
-        var message = FormatException(exception);
-        return diagnostics.Any(static diagnostic => diagnostic.Code == "HSWIN001")
-                && message.Contains("Timer interval must be at least 1 millisecond", StringComparison.Ordinal)
-            || diagnostics.Any(static diagnostic => diagnostic.Code == "HSWIN002")
-                && message.Contains("repeatPulse", StringComparison.Ordinal)
-            || diagnostics.Any(static diagnostic => diagnostic.Code == "HSWIN003")
-                && message.Contains("keyDownMs", StringComparison.Ordinal);
     }
 }

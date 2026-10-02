@@ -1,3 +1,4 @@
+using HsWin.App.Native;
 using HsWin.Core.Alerts;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -147,7 +148,24 @@ internal sealed partial class FollowingToastWindow : IToastView, INativeCursorFo
     public void UpdateRequest(AlertRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        // The cursor follower moves the popup HWND natively, off the UI thread. Adopt that position
+        // before the text change relayouts the popup, or WPF snaps it back to the stale offsets.
+        SyncOffsetsFromNativeWindow();
         _text.Text = request.Text;
+    }
+
+    private void SyncOffsetsFromNativeWindow()
+    {
+        var handle = NativeHandle;
+        if (!_popup.IsOpen || handle == nint.Zero || !ScreenGeometry.TryGetWindowRect(handle, out var rect))
+        {
+            return;
+        }
+
+        var scale = ScreenGeometry.GetScaleAt(rect.Left, rect.Top);
+        Left = rect.Left / scale;
+        Top = rect.Top / scale;
     }
 
     public void PrepareForShow()

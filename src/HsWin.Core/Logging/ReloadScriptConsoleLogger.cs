@@ -11,14 +11,17 @@ namespace HsWin.Core.Logging;
 /// </summary>
 public sealed class ReloadScriptConsoleLogger : IScriptConsoleLogger, IDisposable
 {
+    private const int MaxQueuedEntries = 20_000;
+
     private readonly string _logDirectory;
     private readonly Func<DateTimeOffset> _now;
     private readonly object _gate = new();
-    private readonly BlockingCollection<Entry> _entries = new();
+    private readonly BlockingCollection<Entry> _entries = new(MaxQueuedEntries);
     private readonly Thread _worker;
 
     private string? _currentLogFilePath;
     private int _disposed;
+    private int _dropped;
 
     public ReloadScriptConsoleLogger(string logDirectory)
         : this(logDirectory, () => DateTimeOffset.Now)
@@ -120,9 +123,10 @@ public sealed class ReloadScriptConsoleLogger : IScriptConsoleLogger, IDisposabl
     {
         try
         {
-            if (Volatile.Read(ref _disposed) == 0)
+            // A flood (console.log in a tight loop) must not grow memory without bound.
+            if (Volatile.Read(ref _disposed) == 0 && !_entries.TryAdd(entry))
             {
-                _entries.Add(entry);
+                Interlocked.Increment(ref _dropped);
             }
         }
         catch
@@ -142,6 +146,14 @@ public sealed class ReloadScriptConsoleLogger : IScriptConsoleLogger, IDisposabl
                 while (_entries.TryTake(out var nextEntry))
                 {
                     state = ApplyEntry(state, nextEntry);
+                }
+
+                var dropped = Interlocked.Exchange(ref _dropped, 0);
+                if (dropped > 0 && state.LogFilePath is { } currentPath)
+                {
+                    state = ApplyEntry(
+                        state,
+                        new LineEntry(currentPath, $"{_now():O} [warn] Dropped {dropped} console lines because logging fell behind."));
                 }
 
                 // Queue momentarily drained: flush so recently logged lines are on disk even
@@ -164,13 +176,14 @@ public sealed class ReloadScriptConsoleLogger : IScriptConsoleLogger, IDisposabl
         var rotate = entry as RotateEntry;
         var line = rotate?.Line ?? ((LineEntry)entry).Line;
         var logFilePath = rotate?.LogFilePath ?? ((LineEntry)entry).LogFilePath;
+        var writer = state.Writer;
         try
         {
-            var writer = state.Writer;
             if (writer is null || rotate is not null || state.LogFilePath != logFilePath)
             {
                 writer?.Flush();
                 writer?.Dispose();
+                writer = null;
                 writer = OpenWriter(logFilePath);
             }
 
@@ -179,9 +192,10 @@ public sealed class ReloadScriptConsoleLogger : IScriptConsoleLogger, IDisposabl
         }
         catch
         {
-            // A failed writer must not wedge the worker; drop it, retry the line once through
-            // a one-shot append, and let the next entry recreate the writer.
-            state.Writer?.Dispose();
+            // A failed writer must not wedge the worker or leak its handle (including one that
+            // opened but failed on its first write); drop it, retry the line once through a
+            // one-shot append, and let the next entry recreate the writer.
+            writer?.Dispose();
             try
             {
                 File.AppendAllText(logFilePath, line + Environment.NewLine);
@@ -206,7 +220,15 @@ public sealed class ReloadScriptConsoleLogger : IScriptConsoleLogger, IDisposabl
         }
 
         var stream = new FileStream(logFilePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-        return new StreamWriter(stream);
+        try
+        {
+            return new StreamWriter(stream);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
     }
 
     private abstract record Entry;

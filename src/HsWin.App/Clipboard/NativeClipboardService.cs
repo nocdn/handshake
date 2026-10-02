@@ -8,26 +8,22 @@ internal sealed class NativeClipboardService : IClipboardService, IDisposable
 {
     private readonly IClipboardTextStore _textStore;
     private readonly IClipboardChangeNotifier _changeNotifier;
-    private readonly IRuntimeLogger _logger;
     private long _sequence;
     private bool _disposed;
 
     public NativeClipboardService(Dispatcher dispatcher, IRuntimeLogger logger)
         : this(
-            new WpfClipboardTextStore(dispatcher, logger),
-            new NativeClipboardChangeNotifier(dispatcher, logger),
-            logger)
+            new WpfClipboardTextStore(logger),
+            new NativeClipboardChangeNotifier(dispatcher, logger))
     {
     }
 
     internal NativeClipboardService(
         IClipboardTextStore textStore,
-        IClipboardChangeNotifier changeNotifier,
-        IRuntimeLogger logger)
+        IClipboardChangeNotifier changeNotifier)
     {
         _textStore = textStore;
         _changeNotifier = changeNotifier;
-        _logger = logger;
     }
 
     public string GetText()
@@ -53,8 +49,6 @@ internal sealed class NativeClipboardService : IClipboardService, IDisposable
                 Interlocked.Increment(ref _sequence),
                 contents.Text,
                 contents.HasText);
-            _logger.Info(
-                $"Clipboard change snapshot sequence={snapshot.Sequence} length={snapshot.Contents.Length} hasText={snapshot.HasText}.");
             callback(snapshot);
         });
     }
@@ -67,6 +61,7 @@ internal sealed class NativeClipboardService : IClipboardService, IDisposable
         }
 
         _changeNotifier.Dispose();
+        _textStore.Dispose();
         _disposed = true;
     }
 }

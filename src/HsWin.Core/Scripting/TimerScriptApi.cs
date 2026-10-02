@@ -26,31 +26,53 @@ public sealed class TimerScriptApi
     public ScriptResourceHandle DoAfter(object? delayMs, object? callback)
     {
         var delay = ConvertTimerInterval(delayMs, nameof(delayMs));
-        return CreateTimerHandle(_timers.DoAfter(delay, () => InvokeTimerCallback(callback)), $"doAfter {delay}ms");
+        var scriptFunction = RequireCallback(callback);
+
+        // A one-shot timer releases its handle once it has fired, so it stops being tracked.
+        ScriptResourceHandle? handle = null;
+        var fired = 0;
+        var timer = _timers.DoAfter(delay, () =>
+        {
+            try
+            {
+                _callbacks.InvokeScriptCallback(scriptFunction);
+            }
+            finally
+            {
+                Volatile.Write(ref fired, 1);
+                Volatile.Read(ref handle)?.Dispose();
+            }
+        });
+
+        Volatile.Write(ref handle, new ScriptResourceHandle(timer));
+        Track(handle, $"doAfter {delay}ms");
+        if (Volatile.Read(ref fired) != 0)
+        {
+            handle.Dispose();
+        }
+
+        return handle;
     }
 
     public ScriptResourceHandle DoEvery(object? intervalMs, object? callback)
     {
         var interval = ConvertTimerInterval(intervalMs, nameof(intervalMs));
-        return CreateTimerHandle(_timers.DoEvery(interval, () => InvokeTimerCallback(callback)), $"doEvery {interval}ms");
+        var scriptFunction = RequireCallback(callback);
+        var handle = new ScriptResourceHandle(_timers.DoEvery(interval, () => _callbacks.InvokeScriptCallback(scriptFunction)));
+        Track(handle, $"doEvery {interval}ms");
+        return handle;
     }
 
-    private void InvokeTimerCallback(object? callback)
+    private static ScriptObject RequireCallback(object? callback)
     {
-        if (callback is not ScriptObject scriptFunction)
-        {
-            throw new ArgumentException("Timer callback must be a JavaScript function.", nameof(callback));
-        }
-
-        _callbacks.InvokeScriptCallback(scriptFunction);
+        return callback as ScriptObject
+            ?? throw new ArgumentException("Timer callback must be a JavaScript function.", nameof(callback));
     }
 
-    private ScriptResourceHandle CreateTimerHandle(IDisposable timer, string description)
+    private void Track(ScriptResourceHandle handle, string description)
     {
-        var handle = new ScriptResourceHandle(timer);
         _trackResource(handle);
         _logger.Info($"Script hs.timer.{description} created.");
-        return handle;
     }
 
     private static int ConvertTimerInterval(object? value, string argumentName)

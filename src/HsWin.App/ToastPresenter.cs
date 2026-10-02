@@ -1,15 +1,18 @@
-using HsWin.Core.Alerts;
-using HsWin.Core.Logging;
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Forms;
 using System.Windows.Threading;
+using HsWin.App.Lifecycle;
+using HsWin.App.Native;
+using HsWin.App.Threading;
+using HsWin.Core.Alerts;
+using HsWin.Core.Logging;
 using Point = System.Windows.Point;
 using WpfApplication = System.Windows.Application;
 
 namespace HsWin.App;
 
-internal sealed class ToastPresenter : IAlertPresenter, IDisposable
+internal sealed class ToastPresenter : ICountingAlertPresenter, IDisposable
 {
     private const double HiddenWindowCoordinate = -1_000_000;
 
@@ -107,13 +110,10 @@ internal sealed class ToastPresenter : IAlertPresenter, IDisposable
             return;
         }
 
-        var queuedAt = Stopwatch.GetTimestamp();
-        _logger.Info($"Toast show queued text='{FormatTextForLog(request.Text)}' kind='{request.Kind}' icon='{request.EffectiveIcon}' style='{request.Style}' durationMs={request.DurationMs}.");
         _dispatcher.InvokeAsync(() =>
         {
             if (!_disposed)
             {
-                _logger.Info($"Toast show dequeued text='{FormatTextForLog(request.Text)}' icon='{request.EffectiveIcon}' dispatchDelayMs={Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds:F3}.");
                 ShowOnDispatcher(request);
             }
         }, DispatcherPriority.Send);
@@ -145,7 +145,8 @@ internal sealed class ToastPresenter : IAlertPresenter, IDisposable
             return;
         }
 
-        _dispatcher.Invoke(DisposeOnDispatcher);
+        // Never block shutdown on a wedged UI thread; the windows die with the process anyway.
+        DispatcherGuard.FireAndForget(_dispatcher, DisposeOnDispatcher, "toast teardown", _logger);
     }
 
     private void ShowOnDispatcher(AlertRequest request)
@@ -157,7 +158,6 @@ internal sealed class ToastPresenter : IAlertPresenter, IDisposable
         if (request.DurationMs == 0)
         {
             HideChannel(channel);
-            _logger.Info($"Toast hide timing text='{FormatTextForLog(request.Text)}' totalMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
             return;
         }
 
@@ -201,7 +201,8 @@ internal sealed class ToastPresenter : IAlertPresenter, IDisposable
         StartTimer(channel, request.DurationMs);
 
         _logger.Info(
-            $"Toast show timing text='{FormatTextForLog(request.Text)}' kind='{request.Kind}' icon='{request.EffectiveIcon}' style='{request.Style}' alreadyVisible={wasVisible} wasOnScreen={wasOnScreen} size={window.ActualWidth:F1}x{window.ActualHeight:F1} " +
+            // Toast text can hold clipboard contents or other private data, so only its length is logged.
+            $"Toast show timing textLength={request.Text.Length} kind='{request.Kind}' icon='{request.EffectiveIcon}' style='{request.Style}' alreadyVisible={wasVisible} wasOnScreen={wasOnScreen} size={window.ActualWidth:F1}x{window.ActualHeight:F1} " +
             $"moveMs={ElapsedMs(startedAt, movedAt):F3} updateMs={ElapsedMs(movedAt, updatedAt):F3} " +
             $"showMs={ElapsedMs(updatedAt, shownAt):F3} layoutMs={ElapsedMs(shownAt, layoutAt):F3} " +
             $"positionMs={ElapsedMs(layoutAt, positionedAt):F3} totalMs={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F3}.");
@@ -358,31 +359,24 @@ internal sealed class ToastPresenter : IAlertPresenter, IDisposable
 
     private static void Position(IToastView window)
     {
-        var screen = Screen.FromPoint(Cursor.Position);
-        var workingArea = screen.WorkingArea;
-        var source = PresentationSource.FromVisual(window.PlacementVisual);
-        var transformFromDevice = source?.CompositionTarget?.TransformFromDevice ?? System.Windows.Media.Matrix.Identity;
+        var cursor = Cursor.Position;
+        var workingArea = Screen.FromPoint(cursor).WorkingArea;
 
-        var topLeft = transformFromDevice.Transform(new Point(workingArea.Left, workingArea.Top));
-        var bottomRight = transformFromDevice.Transform(new Point(workingArea.Right, workingArea.Bottom));
+        // The toast is parked off-screen until now, so its own DPI says nothing about the target
+        // monitor; convert with the DPI of the monitor it is about to appear on.
+        var scale = ScreenGeometry.GetScaleAt(cursor.X, cursor.Y);
+        var left = workingArea.Left / scale;
+        var width = workingArea.Width / scale;
+        var bottom = workingArea.Bottom / scale;
         const double bottomPadding = 48;
 
-        window.Left = topLeft.X + ((bottomRight.X - topLeft.X - window.ActualWidth) / 2);
-        window.Top = bottomRight.Y - window.ActualHeight - bottomPadding;
+        window.Left = left + ((width - window.ActualWidth) / 2);
+        window.Top = bottom - window.ActualHeight - bottomPadding;
     }
 
     private static double ElapsedMs(long startTimestamp, long endTimestamp)
     {
         return Stopwatch.GetElapsedTime(startTimestamp, endTimestamp).TotalMilliseconds;
-    }
-
-    private static string FormatTextForLog(string text)
-    {
-        return text
-            .Replace("\\", "\\\\", StringComparison.Ordinal)
-            .Replace("'", "\\'", StringComparison.Ordinal)
-            .Replace("\r", "\\r", StringComparison.Ordinal)
-            .Replace("\n", "\\n", StringComparison.Ordinal);
     }
 
     private sealed class ToastChannel : IDisposable

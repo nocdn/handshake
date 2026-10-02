@@ -1,4 +1,5 @@
 using HsWin.Core.Alerts;
+using HsWin.Core.Scripting;
 
 namespace HsWin.App;
 
@@ -25,12 +26,9 @@ internal static class ConfigReloadAlerts
 
     public static AlertRequest CreateReloadFailedAlert(Exception exception)
     {
-        var message = UserFacingExceptionFormatter.FormatConfigReloadFailure(exception);
-        if (message.Contains("Hotkey already in use", StringComparison.OrdinalIgnoreCase))
-        {
-            message += " Edit config.js or close the conflicting app.";
-        }
-        else if (message.Contains("register hotkey", StringComparison.OrdinalIgnoreCase))
+        var message = ScriptErrorFormatter.Format(exception);
+        if (message.Contains("Hotkey already in use", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("register hotkey", StringComparison.OrdinalIgnoreCase))
         {
             message += " Edit config.js or close the conflicting app.";
         }
