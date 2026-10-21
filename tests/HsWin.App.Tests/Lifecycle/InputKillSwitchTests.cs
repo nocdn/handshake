@@ -60,6 +60,8 @@ public sealed class InputKillSwitchTests
 
         public void Click(MouseButton button) => throw new NotSupportedException();
 
+        public void Scroll(int delta) => throw new NotSupportedException();
+
         public IRepeatSession Repeat(MouseButton button, MouseRepeatOptions options) => throw new NotSupportedException();
     }
 

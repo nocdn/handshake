@@ -14,6 +14,10 @@ public sealed class NullMouseInputService : IMouseInputService
     {
     }
 
+    public void Scroll(int delta)
+    {
+    }
+
     public IRepeatSession Repeat(MouseButton button, MouseRepeatOptions options)
     {
         return new NullRepeatSession(options.IntervalMs);

@@ -5,6 +5,15 @@ namespace HsWin.Core.Tests;
 public sealed class ConfigLinterTests
 {
     [Fact]
+    public void LintSourceAllowsMouseScrollWithoutInjectingInput()
+    {
+        var result = new ConfigLinter().LintSource("hs.mouse.scroll(1); hs.mouse.scroll(-0.5);");
+
+        Assert.True(result.Success);
+        Assert.Empty(result.Diagnostics);
+    }
+
+    [Fact]
     public void LintSourceAllowsDefaultConfig()
     {
         var result = new ConfigLinter().LintSource(ConfigFileService.DefaultConfig);

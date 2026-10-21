@@ -63,6 +63,22 @@ public sealed class NativeInputTests
     }
 
     [Theory]
+    [InlineData(120)]
+    [InlineData(-120)]
+    [InlineData(60)]
+    public void WheelInputUsesTheSignedDeltaAndDoesNotMoveOrClickTheMouse(int delta)
+    {
+        var input = MouseInputSender.BuildScrollInput(delta);
+
+        Assert.Equal(0u, input.Type);
+        Assert.Equal(0x0800u, input.Data.Mouse.Flags);
+        Assert.Equal(delta, unchecked((int)input.Data.Mouse.MouseData));
+        Assert.Equal(0, input.Data.Mouse.Dx);
+        Assert.Equal(0, input.Data.Mouse.Dy);
+        Assert.Equal(NativeInputSender.InjectedExtraInfo, input.Data.Mouse.ExtraInfo);
+    }
+
+    [Theory]
     [InlineData(0x6Fu, 0xE035u, 0x35, true)] // numpad divide
     [InlineData(0xB3u, 0xE022u, 0x22, true)] // media play/pause
     [InlineData(0x5Du, 0xE05Du, 0x5D, true)] // apps

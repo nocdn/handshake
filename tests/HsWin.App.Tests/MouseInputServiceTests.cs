@@ -1,4 +1,5 @@
 using HsWin.App.Input;
+using HsWin.App.Keyboard;
 using HsWin.App.Threading;
 using HsWin.Core.Input;
 using HsWin.Core.Logging;
@@ -8,6 +9,49 @@ namespace HsWin.App.Tests;
 
 public sealed class MouseInputServiceTests
 {
+    [Theory]
+    [InlineData(120)]
+    [InlineData(-120)]
+    [InlineData(60)]
+    public void ScrollSendsTheRequestedSignedDelta(int delta)
+    {
+        var sender = new CapturingMouseInputSender();
+        var service = new MouseInputService(NullRuntimeLogger.Instance, sender);
+
+        service.Scroll(delta);
+
+        Assert.Equal(delta, Assert.Single(sender.Scrolls));
+        Assert.Empty(sender.Clicks);
+    }
+
+    [Fact]
+    public void ScrollWithZeroDeltaSendsNothing()
+    {
+        var sender = new CapturingMouseInputSender();
+        var service = new MouseInputService(NullRuntimeLogger.Instance, sender);
+
+        service.Scroll(0);
+
+        Assert.Empty(sender.Scrolls);
+    }
+
+    [Fact]
+    public void ScrollInsideKeyboardHookDispatchWaitsUntilTheHookReturns()
+    {
+        var sender = new CapturingMouseInputSender();
+        var service = new MouseInputService(NullRuntimeLogger.Instance, sender);
+        using var queue = new SerializedInputQueue(NullRuntimeLogger.Instance);
+
+        using (KeyboardHookDispatchScope.Enter(queue))
+        {
+            service.Scroll(120);
+            Assert.Empty(sender.Scrolls);
+        }
+
+        Assert.True(sender.ScrollSent.Wait(TimeSpan.FromSeconds(2)));
+        Assert.Equal(120, Assert.Single(sender.Scrolls));
+    }
+
     [Fact]
     public void ClickSendsTheRequestedButton()
     {
@@ -98,6 +142,16 @@ public sealed class MouseInputServiceTests
         public List<MouseButton> Clicks { get; } = [];
 
         public List<InputMethod> InputMethods { get; } = [];
+
+        public List<int> Scrolls { get; } = [];
+
+        public ManualResetEventSlim ScrollSent { get; } = new();
+
+        public void SendScroll(int delta, IRuntimeLogger? logger = null)
+        {
+            Scrolls.Add(delta);
+            ScrollSent.Set();
+        }
 
         public void SendClick(MouseButton button, InputMethod inputMethod, IRuntimeLogger? logger = null)
         {

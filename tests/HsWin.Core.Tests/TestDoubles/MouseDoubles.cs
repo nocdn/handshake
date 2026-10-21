@@ -26,6 +26,8 @@ internal sealed class CapturingMouseInputService : IMouseInputService
 {
     public List<MouseButton> Clicks { get; } = [];
 
+    public List<int> Scrolls { get; } = [];
+
     public List<CapturingMouseRepeat> Repeats { get; } = [];
 
     public int StopActiveRepeatCallCount { get; private set; }
@@ -33,6 +35,11 @@ internal sealed class CapturingMouseInputService : IMouseInputService
     public void Click(MouseButton button)
     {
         Clicks.Add(button);
+    }
+
+    public void Scroll(int delta)
+    {
+        Scrolls.Add(delta);
     }
 
     public IRepeatSession Repeat(MouseButton button, MouseRepeatOptions options)

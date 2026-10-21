@@ -6,6 +6,9 @@ public interface IMouseInputService
 {
     void Click(MouseButton button);
 
+    /// <summary>Sends vertical wheel input; positive delta scrolls up, 120 units per notch.</summary>
+    void Scroll(int delta);
+
     IRepeatSession Repeat(MouseButton button, MouseRepeatOptions options);
 
     /// <summary>

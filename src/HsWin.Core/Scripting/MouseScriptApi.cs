@@ -57,6 +57,26 @@ public sealed class MouseScriptApi
         _logger.Info($"Script hs.mouse.click('{MouseButtonParser.GetDisplayName(parsedButton)}') requested.");
     }
 
+    public void Scroll(object? notches = null)
+    {
+        var count = ScriptArgumentReader.IsMissing(notches)
+            ? 1
+            : ScriptArgumentReader.RequireDouble(notches, nameof(notches), "a finite number of wheel notches");
+        var delta = Math.Round(count * MouseScrollEventSnapshot.WheelDelta, MidpointRounding.AwayFromZero);
+        if (delta is < int.MinValue or > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(notches), "Wheel delta must fit in a signed 32-bit integer.");
+        }
+
+        if (delta == 0)
+        {
+            return;
+        }
+
+        _mouseInput.Scroll((int)delta);
+        _logger.Info($"Script hs.mouse.scroll() requested delta={delta.ToString(CultureInfo.InvariantCulture)}.");
+    }
+
     public RepeatScriptHandle Repeat(object? button, object? options = null)
     {
         var parsedButton = MouseButtonParser.Parse(button);

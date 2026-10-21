@@ -18,13 +18,14 @@
 - Never use `GetAsyncKeyState` directly as physical modifier truth while synthetic keyboard input may be active. Route physical modifier queries through `IKeyboardEventService`, whose low-level-hook tracker ignores injected state changes; keep the Win32 P/Invoke centralized in `NativeKeyStateReader`.
 - Runtime diagnostics live under `%APPDATA%\HsWin\runtime-logs`; JavaScript `console.*` output lives under `%APPDATA%\HsWin\config-logs`.
 - The CLI includes `hspn config lint`, which catches config syntax/API mistakes such as invalid timer intervals. After making user config changes, run `hspn config lint` against the changed config; if lint reports anything, fix the config and rerun lint before handing work back. Also run a `hspn -h` so that you know some of the features of the CLI.
-- **After every code change**, before handing work back, run this full verification loop (do not skip steps):
+- **After every change to application source code or build/packaging files**, before handing work back, run this full verification loop (do not skip steps):
   1. **Kill** any running `Hammerspoon (Windows Edition)` or `HsWin.App` instances so the old build is not left running.
   2. **Build:** `dotnet build HsWin.slnx`
   3. **Test:** `dotnet test HsWin.slnx`
   4. **Installer:** `.\scripts\Build-Installer.ps1` (only if build and tests pass).
   5. **Launch for manual test:** start `artifacts\installer\hswin-x64-setup.exe` for the user to install and try the change. Do **not** use `dotnet run` as the primary handoff.
-  This loop applies to all app/UI changes the user will want to see in the running product—not only release-sized work.
+  This loop applies to application changes in `HsWin.Core`, `HsWin.App`, and `HsWin.Cli`, including all app/UI changes the user will want to see in the running product—not only release-sized work.
+- **Personal config edits do not require an installer.** When only changing the user's config (for example, `%APPDATA%\HsWin\config.js`), run `hspn -h`, lint the changed config with `hspn config lint <path>`, and, once lint passes, run `hspn config reload` to apply it in the running app. Do not kill the app, rebuild it, run the full app test suite, or build/launch the installer for personal-config-only changes. Documentation/instruction-only changes (including `AGENTS.md`) also do not trigger the application verification loop. If the task also changes application source code or build/packaging files, run the full loop above.
 - The installer uses Inno Setup, so `ISCC.exe` must be installed or `INNO_SETUP_ISCC` must point to it.
 - GitHub Actions release publishing lives in `.github/workflows/release.yml`; releases are normal non-prerelease releases, tagged with the Actions run number.
 - Make sure all code that you write, change, modify, add, etc is maintainable and high quality. We don't want technical debt so don't be lazy.

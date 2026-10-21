@@ -772,6 +772,10 @@
         return host.Mouse.Click(button);
       },
 
+      scroll(notches) {
+        return host.Mouse.Scroll(notches);
+      },
+
       repeat(button, options) {
         return host.Mouse.Repeat(button, options);
       },

@@ -7,6 +7,64 @@ namespace HsWin.Core.Tests;
 
 public sealed class MouseScriptRuntimeTests
 {
+    [Theory]
+    [InlineData("", 120)]
+    [InlineData("undefined", 120)]
+    [InlineData("null", 120)]
+    [InlineData("1", 120)]
+    [InlineData("-1", -120)]
+    [InlineData("2", 240)]
+    [InlineData("0.5", 60)]
+    [InlineData("-0.5", -60)]
+    [InlineData("0.0125", 2)]
+    [InlineData("-0.0125", -2)]
+    [InlineData("17895697", 2147483640)]
+    [InlineData("-17895697", -2147483640)]
+    public void ScrollConvertsNotchesToSignedWheelUnits(string argument, int expectedDelta)
+    {
+        var mouseInput = new CapturingMouseInputService();
+        using var runtime = new ScriptRuntime(new ScriptRuntimeServices { MouseInput = mouseInput });
+
+        runtime.Reload($"hs.mouse.scroll({argument});");
+
+        Assert.Equal(expectedDelta, Assert.Single(mouseInput.Scrolls));
+        Assert.Empty(mouseInput.Clicks);
+        Assert.Empty(mouseInput.Repeats);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("0.001")]
+    public void ScrollDoesNotInjectWhenTheRoundedDeltaIsZero(string argument)
+    {
+        var mouseInput = new CapturingMouseInputService();
+        using var runtime = new ScriptRuntime(new ScriptRuntimeServices { MouseInput = mouseInput });
+
+        runtime.Reload($"hs.mouse.scroll({argument});");
+
+        Assert.Empty(mouseInput.Scrolls);
+    }
+
+    [Theory]
+    [InlineData("NaN")]
+    [InlineData("Infinity")]
+    [InlineData("-Infinity")]
+    [InlineData("1e300")]
+    [InlineData("-1e300")]
+    [InlineData("17895698")]
+    [InlineData("-17895698")]
+    [InlineData("\"up\"")]
+    [InlineData("{}")]
+    public void ScrollRejectsInvalidNotchesBeforeInjecting(string argument)
+    {
+        var mouseInput = new CapturingMouseInputService();
+        using var runtime = new ScriptRuntime(new ScriptRuntimeServices { MouseInput = mouseInput });
+
+        Assert.ThrowsAny<Exception>(() => runtime.Reload($"hs.mouse.scroll({argument});"));
+
+        Assert.Empty(mouseInput.Scrolls);
+    }
+
     [Fact]
     public void ReloadExposesMouseCurrentScreen()
     {

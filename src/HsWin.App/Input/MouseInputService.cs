@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using HsWin.App.Keyboard;
 using HsWin.App.Threading;
 using HsWin.Core.Input;
 using HsWin.Core.Logging;
@@ -29,6 +30,20 @@ internal sealed class MouseInputService : IMouseInputService
     public void Click(MouseButton button)
     {
         _inputSender.SendClick(button, InputMethod.SendInput, _logger);
+    }
+
+    public void Scroll(int delta)
+    {
+        if (delta == 0)
+        {
+            return;
+        }
+
+        // Like keyboard injection, wheel input must wait for a blocking keyboard hook to return.
+        if (!KeyboardHookDispatchScope.TryDefer(() => _inputSender.SendScroll(delta, _logger)))
+        {
+            _inputSender.SendScroll(delta, _logger);
+        }
     }
 
     public IRepeatSession Repeat(MouseButton button, MouseRepeatOptions options)
@@ -190,6 +205,11 @@ internal sealed class MouseInputService : IMouseInputService
 
         private NativeMouseInputSender()
         {
+        }
+
+        public void SendScroll(int delta, IRuntimeLogger? logger = null)
+        {
+            MouseInputSender.SendScroll(delta, logger);
         }
 
         public void SendClick(MouseButton button, InputMethod inputMethod, IRuntimeLogger? logger = null)

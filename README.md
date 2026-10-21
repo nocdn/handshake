@@ -574,6 +574,17 @@ hs.timer.doAfter(1000, () => {
 });
 ```
 
+### `hs.mouse.scroll(notches?)`
+
+Sends vertical mouse-wheel input through `SendInput`. Positive values scroll up, negative values scroll down, and the default is one notch up. Fractional notches are supported, rounded to the nearest Windows wheel unit (120 units per notch); zero sends nothing. Non-finite values and values outside the signed 32-bit wheel-delta range are rejected. Wheel events carry HsWin's injected-input marker and are ignored by `watchScroll` unless `includeInjected` is enabled. Calls from a blocking keyboard watcher are deferred until its hook callback returns.
+
+```js
+hs.mouse.scroll();     // One notch up.
+hs.mouse.scroll(1);    // One notch up.
+hs.mouse.scroll(-1);   // One notch down.
+hs.mouse.scroll(0.5);  // Half a notch up.
+```
+
 ### `hs.mouse.watchScroll(callback, options?)`
 
 Subscribes to global mouse wheel events (vertical wheel and horizontal tilt wheel). **Callbacks always run off the Windows low-level mouse hook path**, so they never delay physical mouse input or hold the script lock on the hook thread.

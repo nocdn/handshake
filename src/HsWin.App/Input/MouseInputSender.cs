@@ -6,7 +6,7 @@ using HsWin.Core.Mouse;
 namespace HsWin.App.Input;
 
 /// <summary>
-/// Sends mouse button clicks with SendInput.
+/// Sends mouse button clicks and vertical wheel events with SendInput.
 /// </summary>
 internal static class MouseInputSender
 {
@@ -20,6 +20,24 @@ internal static class MouseInputSender
     private const uint MouseEventXUp = 0x0100;
     private const uint XButton1 = 0x0001;
     private const uint XButton2 = 0x0002;
+    private const uint MouseEventWheel = 0x0800;
+
+    internal static NativeInput BuildScrollInput(int delta)
+    {
+        return NativeInputSender.Mouse(MouseEventWheel, unchecked((uint)delta));
+    }
+
+    internal static void SendScroll(int delta, IRuntimeLogger? logger = null)
+    {
+        ReadOnlySpan<NativeInput> inputs = [BuildScrollInput(delta)];
+        if (NativeInputSender.TrySend(inputs, out var sentCount, out var error))
+        {
+            return;
+        }
+
+        logger?.Warning($"SendInput sent {sentCount}/1 mouse wheel events delta={delta} win32=0x{error:X}.");
+        throw new Win32Exception(error, "Could not send mouse wheel input.");
+    }
 
     internal static void SendClick(MouseButton button, IRuntimeLogger? logger = null)
     {
