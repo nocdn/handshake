@@ -599,6 +599,18 @@
   };
 
   globalThis.hs = Object.freeze({
+    drawing: Object.freeze({
+      rectangle(frame) {
+        return host.Drawing.Rectangle(frame);
+      }
+    }),
+
+    screen: Object.freeze({
+      allScreens() {
+        return parseJson(host.Screens.AllScreensJson());
+      }
+    }),
+
     magnifier: Object.freeze({
       new(options) {
         return host.Magnifier.Create(options);
@@ -760,6 +772,13 @@
     http,
 
     mouse: Object.freeze({
+      watchButtons(callback, options) {
+        if (typeof callback !== "function") throw new Error("Mouse button watch callback must be a function.");
+        return host.Mouse.WatchButtons((type, button, isDown, isUp, isInjected, modifierFlags, x, y) =>
+          callback({ type, button, isDown, isUp, isInjected, modifierFlags,
+            modifiers: modifierNamesFromFlags(modifierFlags), x, y }), options);
+      },
+
       getCurrentScreen() {
         return parseJson(host.Mouse.GetCurrentScreenJson());
       },

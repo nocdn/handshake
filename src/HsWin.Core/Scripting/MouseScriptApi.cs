@@ -141,4 +141,19 @@ public sealed class MouseScriptApi
             _ => axes.ToString().ToLowerInvariant()
         };
     }
+
+    public ScriptResourceHandle WatchButtons(object? callback, object? options = null)
+    {
+        if (callback is not ScriptObject scriptFunction)
+            throw new ArgumentException("Mouse button watch callback must be a JavaScript function.", nameof(callback));
+
+        var parsed = MouseScriptOptionsParser.ParseButtonWatchOptions(options);
+        var registration = _mouseEvents.WatchButtons(parsed, input => _callbacks.InvokeScriptCallback(
+            scriptFunction, input.IsDown ? "mousedown" : "mouseup", MouseButtonParser.GetDisplayName(input.Button),
+            input.IsDown, !input.IsDown, input.IsInjected, input.ModifierFlags, input.X, input.Y));
+        var handle = new ScriptResourceHandle(registration);
+        _trackResource(handle);
+        _logger.Info($"Script hs.mouse.watchButtons() registered includeInjected={parsed.IncludeInjected} blocking={parsed.Blocking}.");
+        return handle;
+    }
 }

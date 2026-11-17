@@ -13,6 +13,9 @@ internal sealed class NativeMouseEventService : IMouseEventService, IMouseButton
     private readonly NativeMouseHotkeyHook _mouseHook;
     public IDisposable WatchPhysicalButtons(Action<PhysicalMouseButtonEvent> callback) => _mouseHook.WatchPhysicalButtons(callback);
 
+    public IDisposable WatchButtons(MouseButtonWatchOptions options, Action<MouseButtonEventSnapshot> callback) =>
+        _mouseHook.WatchButtons(options, callback);
+
     public NativeMouseEventService(NativeMouseHotkeyHook mouseHook)
     {
         _mouseHook = mouseHook ?? throw new ArgumentNullException(nameof(mouseHook));

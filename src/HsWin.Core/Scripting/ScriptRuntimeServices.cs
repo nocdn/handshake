@@ -2,6 +2,8 @@ using HsWin.Core.Alerts;
 using HsWin.Core.Applications;
 using HsWin.Core.Audio;
 using HsWin.Core.Clipboard;
+using HsWin.Core.Drawing;
+using HsWin.Core.Screens;
 using HsWin.Core.Hotkeys;
 using HsWin.Core.Http;
 using HsWin.Core.Keyboard;
@@ -17,6 +19,10 @@ namespace HsWin.Core.Scripting;
 
 public sealed record ScriptRuntimeServices
 {
+    public IDrawingService Drawing { get; init; } = NullDrawingService.Instance;
+
+    public IScreenProvider Screens { get; init; } = NullScreenProvider.Instance;
+
     public IMagnifierService Magnifier { get; init; } = NullMagnifierService.Instance;
 
     public IAlertPresenter Alerts { get; init; } = NullAlertPresenter.Instance;

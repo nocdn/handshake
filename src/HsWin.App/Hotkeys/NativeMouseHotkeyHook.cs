@@ -5,6 +5,7 @@ using HsWin.Core.Hotkeys;
 using HsWin.Core.Keyboard;
 using HsWin.Core.Logging;
 using HsWin.Core.Mouse;
+using HsWin.Core.Scripting;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
@@ -40,6 +41,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
     private readonly IKeyboardEventService? _keyboardEvents;
     private readonly SynchronizationContext? _callbackContext;
     private readonly MouseScrollWatchDispatcher _scrollDispatcher;
+    private readonly MouseButtonWatchDispatcher _buttonDispatcher;
     private readonly Dictionary<int, RegistrationState> _registrations = [];
     private readonly Dictionary<(HotkeyMouseButton Button, HotkeyModifiers Modifiers), RegistrationState> _registrationsByHotkey = [];
     private readonly Dictionary<HotkeyMouseButton, RegistrationState> _activeRegistrations = [];
@@ -65,7 +67,8 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
         IMouseHookPlatform platform,
         SynchronizationContext? callbackContext,
         MouseScrollWatchDispatcher? scrollDispatcher = null,
-        IKeyboardEventService? keyboardEvents = null)
+        IKeyboardEventService? keyboardEvents = null,
+        IScriptCallbackScheduler? buttonScheduler = null)
     {
         _logger = logger;
         _platform = platform;
@@ -76,6 +79,25 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
                 logger,
                 new SynchronizationContextCallbackScheduler(callbackContext));
         _hook = new LowLevelHookThread(LowLevelHookThread.MouseHookId, "HsWin Mouse Hook", HookCallback, platform, logger);
+        _buttonDispatcher = new MouseButtonWatchDispatcher(logger,
+            buttonScheduler ?? new SynchronizationContextCallbackScheduler(callbackContext), ReconsiderHook);
+    }
+
+    public IDisposable WatchButtons(MouseButtonWatchOptions options, Action<MouseButtonEventSnapshot> callback)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(callback);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _hook.EnsureInstalled();
+            return _buttonDispatcher.Watch(options, callback);
+        }
+    }
+
+    private void ReconsiderHook()
+    {
+        lock (_gate) MaybeUninstallHookUnlocked();
     }
 
     public IDisposable Register(HotkeyDefinition hotkey, Action pressed)
@@ -190,6 +212,7 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
             }
 
             _scrollSubscriptions.Clear();
+            _buttonDispatcher.Clear();
             foreach (var observer in _buttonObservers) observer.Deactivate();
             _buttonObservers.Clear();
             Volatile.Write(ref _buttonObserverSnapshot, []);
@@ -303,9 +326,12 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
             return HandleScrollMessage(code, wParam, lParam, message);
         }
 
-        if (message is WmMButtonDown or WmMButtonUp or WmXButtonDown or WmXButtonUp)
+        if (message is 0x0201 or 0x0202 or 0x0204 or 0x0205 or WmMButtonDown or WmMButtonUp or WmXButtonDown or WmXButtonUp)
         {
             var hookData = Marshal.PtrToStructure<MouseHookStruct>(lParam);
+            if (MouseButtonEventDecoder.TryDecode(message, hookData.MouseData, hookData.Flags,
+                    hookData.Point.X, hookData.Point.Y, (uint)ReadPressedModifiers(), out var buttonInput)
+                && _buttonDispatcher.Dispatch(buttonInput)) return new IntPtr(1);
             if (TryGetMouseButtonEvent(message, hookData.MouseData, out var mouseButtonEvent))
             {
                 if ((hookData.Flags & LlmhfInjected) == 0)
@@ -468,9 +494,10 @@ internal sealed class NativeMouseHotkeyHook : IDisposable
 
     private void MaybeUninstallHookUnlocked()
     {
-        if (_registrations.Count == 0 && _scrollSubscriptions.Count == 0 && _buttonObservers.Count == 0)
+        if (_registrations.Count == 0 && _scrollSubscriptions.Count == 0 && _buttonObservers.Count == 0 && !_buttonDispatcher.NeedsHook)
         {
             _activeRegistrations.Clear();
+            _buttonDispatcher.Clear();
             _hook.Uninstall();
         }
     }

@@ -10,6 +10,8 @@ public sealed class HsScriptHost
         Action<IDisposable> trackResource = resources.Track;
 
         Alerts = new AlertScriptApi(services.Alerts);
+        Drawing = new DrawingScriptApi(services.Drawing, trackResource);
+        Screens = new ScreenScriptApi(services.Screens);
         Magnifier = new MagnifierScriptApi(services.Magnifier, services.KeyboardEvents, services.MouseButtons, trackResource);
         Console = new ConsoleScriptApi(services.Console);
         Clipboard = new ClipboardScriptApi(
@@ -64,6 +66,10 @@ public sealed class HsScriptHost
     }
 
     public AlertScriptApi Alerts { get; }
+
+    public DrawingScriptApi Drawing { get; }
+
+    public ScreenScriptApi Screens { get; }
 
     public MagnifierScriptApi Magnifier { get; }
 

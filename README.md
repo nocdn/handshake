@@ -52,6 +52,31 @@ hspn config lint C:\Users\you\AppData\Roaming\HsWin\config.js
 
 The `hs` global and `console` are frozen. Reloading config rebuilds the JavaScript engine and disposes hotkeys, keyboard watchers, clipboard watchers, timers, and native keyboard repeats from the previous load.
 
+### `hs.drawing.rectangle(frame)` / `hs.screen.allScreens()`
+
+Draws a filled rectangle anywhere on the desktop. Drawings are initially hidden, always on top, click-through, absent from the taskbar, and never take keyboard focus. A dedicated drawing thread handles their windows independently of the app UI and input hooks.
+
+```js
+const marker = hs.drawing.rectangle({ x: 100, y: 100, w: 300, h: 200 })
+  .setFillColor({ red: 1, green: 0.2, blue: 0, alpha: 0.7 })
+  .show();
+marker.setFrame({ x: 200, y: 150, width: 400, height: 250 });
+console.log(marker.isVisible);
+marker.hide();
+marker.delete();
+
+// Cover every monitor with black, including its taskbar:
+const covers = hs.screen.allScreens().map(screen =>
+  hs.drawing.rectangle(screen.bounds)
+    .setFillColor({ red: 0, green: 0, blue: 0, alpha: 1 }).show());
+// Restore the displays:
+covers.forEach(cover => cover.delete());
+```
+
+Frames use integer physical pixels in the Windows virtual desktop, with negative `x`/`y` supported for monitors left of or above the primary display. `width`/`height` (aliases `w`/`h`) must be positive. Fill color channels are numbers from `0` to `1`; omitted RGB channels default to `0`, and `alpha` defaults to `1` (opaque). Rectangles default to opaque black without a stroke. `show()`, `hide()`, `setFrame()`, and `setFillColor()` return the drawing for chaining. `stop()`, `dispose()`, and `delete()` destroy it; show/update after destruction raises an error, while hide/delete remain safe to repeat.
+
+`hs.screen.allScreens()` returns the currently connected monitors, each with `id`, `name`, `isPrimary`, `bounds`, and `workingArea`. Both rectangles have `x`, `y`, `width`, and `height`; use `bounds` for complete coverage. Enumerate again after a display layout change. Config reload, failed config loads, Emergency Stop, and shutdown destroy all script-owned drawings automatically. Overlays work over the composed desktop and borderless games; exclusive fullscreen games may require borderless mode. They cover the displayed image without pausing the game, muting audio, or blocking input.
+
 ### `hs.magnifier.bindHeld(modifiers, key, options?)` / `hs.magnifier.new(options?)`
 
 Shows a live circular magnifying lens at the center of a screen, with a white ring. Only the lens is zoomed; the rest of the desktop keeps its normal size. Mouse input passes through it, including while hovering over the lens, and it never takes keyboard focus. Press/release has no fade animation.
@@ -584,6 +609,29 @@ hs.mouse.scroll(1);    // One notch up.
 hs.mouse.scroll(-1);   // One notch down.
 hs.mouse.scroll(0.5);  // Half a notch up.
 ```
+
+### `hs.mouse.watchButtons(callback, options?)`
+
+Observes `left`, `right`, `middle`, `back`, and `forward` mouse-button presses and releases. Callbacks run off the input hook, in event order for each watcher. Mouse movement and wheel input are separate from button events.
+
+```js
+const clicks = hs.mouse.watchButtons(event => {
+  console.log(event.type, event.button, event.x, event.y);
+});
+clicks.stop();
+
+// Temporarily consume clicks, for example while your script displays an overlay:
+const blocker = hs.mouse.watchButtons(event => {
+  if (event.isDown) {
+    // Hide your drawings here. This click never reaches the foreground application.
+    blocker.stop();
+  }
+}, { blocking: true });
+```
+
+Events contain `type` (`mousedown`/`mouseup`), `button`, `isDown`, `isUp`, `isInjected`, `modifiers`, `modifierFlags`, `x`, and `y`. Coordinates are physical desktop pixels. Options are `includeInjected` (default `false`) and `blocking` (default `false`, aliases `swallow`/`preventDefault`). Blocking swallows presses and their matching releases **natively**, before mouse hotkeys and physical-button observers, without waiting for the callback; returning `true` from a callback does not control swallowing. A button held before registration keeps its normal release. Stopping a watch after a swallowed press still swallows that press's later release; subsequent presses pass normally unless another blocker is active. Injected and physical presses have separate pairing state.
+
+Handles support `stop()`, `dispose()`, and `delete()`; reload, failed config loads, Emergency Stop, and shutdown dispose active watches and cancel queued callbacks. Button watches share the existing mouse hook. Slow observers have a bounded backlog of 128 events; excess observations are dropped with one warning per watcher while native swallowing continues.
 
 ### `hs.mouse.watchScroll(callback, options?)`
 

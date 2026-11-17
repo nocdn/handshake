@@ -7,6 +7,8 @@ using HsWin.Core.Logging;
 using HsWin.Core.Scripting;
 using HsWin.App.Audio;
 using HsWin.App.Clipboard;
+using HsWin.App.Drawing;
+using HsWin.App.Screens;
 using HsWin.App.Hotkeys;
 using HsWin.App.Input;
 using HsWin.App.Keyboard;
@@ -47,6 +49,7 @@ internal sealed class AppController : IDisposable
     private readonly NativeMouseHotkeyHook _mouseHook;
     private readonly NativeWindowService _windowService;
     private readonly NativeMagnifierService _magnifierService;
+    private readonly NativeDrawingService _drawingService;
     private readonly ScriptRuntime _scriptRuntime;
     private readonly StartupService _startupService;
     private readonly CliInstallService _cliInstallService;
@@ -83,6 +86,7 @@ internal sealed class AppController : IDisposable
         _timerService = new PreciseScriptTimerService(dispatcher);
         _clipboardService = new NativeClipboardService(dispatcher, _logger);
         _magnifierService = new NativeMagnifierService(_logger);
+        _drawingService = new NativeDrawingService(_logger);
         var mouseEventService = new NativeMouseEventService(_mouseHook);
         _windowService = new NativeWindowService(_logger);
         _scriptRuntime = new ScriptRuntime(new ScriptRuntimeServices
@@ -106,6 +110,8 @@ internal sealed class AppController : IDisposable
             Mouse = new NativeMouseService(),
             Windows = _windowService,
             Magnifier = _magnifierService,
+            Drawing = _drawingService,
+            Screens = new NativeScreenProvider(),
             Http = new SystemHttpService(_logger),
             Logger = _logger
         });
@@ -236,6 +242,7 @@ internal sealed class AppController : IDisposable
         _inputKillSwitch.ReleaseHeldKeys("Shutdown");
 
         _magnifierService.Dispose();
+        _drawingService.Dispose();
         _hotkeyService.Dispose();
         _logger.Info("Hotkey service disposed.");
         _mouseHook.Dispose();

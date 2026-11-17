@@ -5,6 +5,15 @@ namespace HsWin.Core.Mouse;
 
 public static class MouseScriptOptionsParser
 {
+    public static MouseButtonWatchOptions ParseButtonWatchOptions(object? value)
+    {
+        if (!ScriptArgumentReader.IsMissing(value) && !ScriptArgumentReader.IsOptionsObject(value))
+            throw new ArgumentException("Mouse button watch options must be an object.", nameof(value));
+        return new(
+            ScriptArgumentReader.OptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "includeInjected"), "includeInjected", false),
+            ScriptArgumentReader.OptionalBoolean(ScriptArgumentReader.GetPropertyValue(value, "blocking", "swallow", "preventDefault"), "blocking", false));
+    }
+
     public static MouseRepeatOptions ParseRepeatOptions(object? value)
     {
         if (ScriptArgumentReader.IsMissing(value))

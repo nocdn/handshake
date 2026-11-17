@@ -14,4 +14,6 @@ public sealed class NullMouseEventService : IMouseEventService
     {
         return EmptyDisposable.Instance;
     }
+
+    public IDisposable WatchButtons(MouseButtonWatchOptions options, Action<MouseButtonEventSnapshot> callback) => EmptyDisposable.Instance;
 }

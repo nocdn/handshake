@@ -81,6 +81,15 @@ internal sealed class CapturingRepeatSession : IRepeatSession
 
 internal sealed class CapturingMouseEventService : IMouseEventService
 {
+    public List<(MouseButtonWatchOptions Options, Action<MouseButtonEventSnapshot> Callback, CapturingDisposable Registration)> ButtonWatches { get; } = [];
+
+    public IDisposable WatchButtons(MouseButtonWatchOptions options, Action<MouseButtonEventSnapshot> callback)
+    {
+        var registration = new CapturingDisposable();
+        ButtonWatches.Add((options, callback, registration));
+        return registration;
+    }
+
     public List<CapturingMouseScrollWatch> Watches { get; } = [];
 
     public IDisposable WatchScroll(MouseScrollWatchOptions options, Action<MouseScrollEventSnapshot> callback)
